@@ -199,3 +199,33 @@ def test_http_error_handling(screener):
         with pytest.raises(PermissionError, match="403 Forbidden"):
             screener.fetch_all_tickers_snapshot()
 
+
+def test_yfinance_screener_rules():
+    """Test YFinanceScreener filtering rules on mock quotes and fundamentals."""
+    from yfinance_screener import YFinanceScreener
+
+    yf_screener = YFinanceScreener()
+
+    mock_quotes = [
+        {"symbol": "WIN1", "regularMarketPrice": 5.0, "regularMarketChangePercent": 15.0, "regularMarketVolume": 1_000_000, "marketCap": 25_000_000},
+        {"symbol": "FAIL_HIGH_MCAP", "regularMarketPrice": 4.0, "regularMarketChangePercent": 10.0, "regularMarketVolume": 800_000, "marketCap": 150_000_000},
+        {"symbol": "FAIL_LOW_VOL", "regularMarketPrice": 3.0, "regularMarketChangePercent": 20.0, "regularMarketVolume": 100_000, "marketCap": 10_000_000},
+        {"symbol": "NON_US.TO", "regularMarketPrice": 4.0, "regularMarketChangePercent": 12.0, "regularMarketVolume": 900_000, "marketCap": 20_000_000},
+    ]
+
+    mock_fundamentals = {
+        "WIN1": {"float_shares": 5_000_000, "market_cap": 25_000_000},
+        "FAIL_HIGH_MCAP": {"float_shares": 6_000_000, "market_cap": 150_000_000},
+        "FAIL_LOW_VOL": {"float_shares": 2_000_000, "market_cap": 10_000_000},
+    }
+
+    yf_screener.fetch_candidates = lambda: mock_quotes
+    yf_screener.get_ticker_float_and_mcap = lambda sym: mock_fundamentals.get(sym, {"float_shares": None, "market_cap": None})
+
+    df = yf_screener.scan()
+    assert len(df) == 1
+    assert df.iloc[0]["Ticker"] == "WIN1"
+    assert df.iloc[0]["Price"] == 5.0
+    assert df.iloc[0]["Est. Float (M)"] == 5.0
+    assert df.iloc[0]["Market Cap ($M)"] == 25.0
+

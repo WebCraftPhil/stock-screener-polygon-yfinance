@@ -109,11 +109,10 @@ class PolygonScreener:
         """
         self._validate_api_key()
         url = f"{self.BASE_URL}/v2/snapshot/locale/us/markets/stocks/tickers"
-        params = {"apiKey": self.api_key}
 
         logger.info("Fetching US market snapshot from Polygon.io...")
         try:
-            response = self.session.get(url, params=params, timeout=self.timeout)
+            response = self.session.get(url, timeout=self.timeout)
 
             if response.status_code == 401:
                 raise PermissionError("HTTP 401 Unauthorized: Invalid Polygon.io API key.")
@@ -148,17 +147,16 @@ class PolygonScreener:
         """
         self._validate_api_key()
         url = f"{self.BASE_URL}/v3/reference/tickers/{ticker}"
-        params = {"apiKey": self.api_key}
 
         try:
-            response = self.session.get(url, params=params, timeout=self.timeout)
+            response = self.session.get(url, timeout=self.timeout)
 
             if response.status_code == 429:
                 # Rate limit handling: backoff briefly and retry once
                 retry_after = int(response.headers.get("Retry-After", 12))
                 logger.warning(f"Rate limited (429) on {ticker}. Pausing for {retry_after}s...")
                 time.sleep(retry_after)
-                response = self.session.get(url, params=params, timeout=self.timeout)
+                response = self.session.get(url, timeout=self.timeout)
 
             if response.status_code == 404:
                 logger.debug(f"Ticker details not found for {ticker} (404).")

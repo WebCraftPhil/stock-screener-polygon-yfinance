@@ -1,17 +1,22 @@
-# Small-Cap Momentum Stock Screener (Massive / Polygon.io)
+# Small-Cap Momentum Stock Screener
 
-A Python screener utilizing the [Massive / Polygon.io REST API](https://massive.com/docs/rest/stocks/overview) to identify high-momentum small-cap stocks setting up during premarket trading.
+A Python stock screener for small-cap momentum stocks, supporting three scripts:
+1. **Yahoo Finance ([`yfinance_screener.py`](yfinance_screener.py))**: **100% Free** — requires NO API key or paid subscription.
+2. **Massive Official SDK ([`massive_screener.py`](massive_screener.py))**: Uses [`massive`](https://github.com/massive-com/client-python) (`RESTClient`).
+3. **Polygon.io / Massive REST ([`momentum_screener.py`](momentum_screener.py))**: Direct REST implementation with built-in `--demo` simulation mode.
+
+---
 
 ## Screening Criteria
 
-The screener filters the US equity market based on these exact rules:
+Both screeners enforce these exact momentum rules:
 - **Price**: Between `$2.00` and `$10.00`
-- **Premarket Volume**: Greater than or equal to `500,000` shares
+- **Volume**: Greater than or equal to `500,000` shares
 - **Float**: Less than or equal to `10,000,000` shares (10M)
 - **Market Cap**: Less than or equal to `$100M` ($100,000,000)
-- **Premarket Gap**: Greater than or equal to `+5.0%`
+- **Gap / Change**: Greater than or equal to `+5.0%`
 
-Results are automatically sorted by **Volume in descending order** and displayed as a clean, formatted Pandas DataFrame in the terminal.
+Results are sorted by **Volume in descending order** and outputted as a formatted Pandas DataFrame.
 
 ---
 
@@ -20,84 +25,64 @@ Results are automatically sorted by **Volume in descending order** and displayed
 | Column | Description | Format |
 | :--- | :--- | :--- |
 | **Ticker** | Stock symbol | `ABCD` |
-| **Price** | Current / premarket trade price | `$4.50` |
+| **Price** | Current / session trade price | `$4.50` |
 | **Gap %** | Percentage change from previous close | `+14.62%` |
 | **Volume** | Current session cumulative volume | `1,850,000` |
 | **Market Cap ($M)** | Market capitalization in millions | `$25.00` |
-| **Est. Float (M)** | Estimated public float in millions | `7.20` |
+| **Est. Float (M)** | Public float in millions | `7.20` |
 
 ---
 
-## Installation & Setup
+## Quick Start (Free Yahoo Finance Screener)
 
-1. **Clone & Navigate:**
-   ```bash
-   cd stock-screener-polygon-yfinance
-   ```
+No API key or account needed. Run directly:
 
-2. **Create and Activate Virtual Environment:**
-   ```bash
-   python3 -m venv .venv
-   source .venv/bin/activate
-   ```
+```bash
+python yfinance_screener.py
+```
 
-3. **Install Dependencies:**
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-4. **Configure API Key:**
-   The screener supports keys configured under either `MASSIVE_API_KEY` or `POLYGON_API_KEY`.
-   
-   Create or edit the `.env` file in the project root:
-   ```env
-   MASSIVE_API_KEY=your_api_key_here
-   ```
-   *(or `POLYGON_API_KEY=your_api_key_here`)*
-
-   Alternatively, export it directly in your terminal:
-   ```bash
-   export MASSIVE_API_KEY="your_api_key_here"
-   ```
+### Sample Live Output:
+```
+================================================================================
+                SMALL-CAP MOMENTUM SCREENER (YAHOO FINANCE)
+================================================================================
+Rules: Price: $2-$10 | Vol: >=500K | Float: <=10M | MktCap: <=$100M | Gap: >=+5%
+--------------------------------------------------------------------------------
+Ticker Price   Gap %     Volume Market Cap ($M) Est. Float (M)
+  CLRO $6.04 +77.38% 32,619,501          $16.17           0.89
+  FTFT $3.57 +22.11%    905,515          $28.84           5.39
+--------------------------------------------------------------------------------
+Total matching stocks: 2
+================================================================================
+```
 
 ---
 
-## Usage
+## Polygon.io / Massive Screener
 
-### 1. Live Screening
-Run the screener against the live Polygon.io API:
+### Why did you see "HTTP 403 Forbidden: Access to US stock snapshots is not allowed on your Polygon.io plan"?
+Polygon.io (Massive) offers a free "Basic" plan, but **restricts the market-wide US snapshot endpoint (`/v2/snapshot/locale/us/markets/stocks/tickers`) to paid plans** (Starter at $29/mo or Developer at $79/mo).
+
+If you have a paid plan, configure your key in `.env`:
+```env
+MASSIVE_API_KEY=your_key_here
+```
+*(or `POLYGON_API_KEY=your_key_here`)*
+
+And run:
 ```bash
 python momentum_screener.py
 ```
 
-Pass the API key explicitly if not using environment variables:
-```bash
-python momentum_screener.py --api-key "your_api_key_here"
-```
-
-### 2. Demonstration / Mock Mode
-Test the script and verify the output formatting and filtering rules without needing an active API key:
+Or run the built-in simulated test:
 ```bash
 python momentum_screener.py --demo
 ```
 
-### 3. Custom Thresholds
-All screening parameters can be adjusted via CLI flags:
-```bash
-python momentum_screener.py \
-  --min-price 3.00 \
-  --max-price 8.00 \
-  --min-volume 1000000 \
-  --max-float 8000000 \
-  --max-market-cap 80000000 \
-  --min-gap 10.0
-```
-
 ---
 
-## Running Tests
+## Running Automated Tests
 
-Execute the unit test suite:
 ```bash
 python -m pytest tests/test_screener.py -v
 ```
