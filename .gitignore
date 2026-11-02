@@ -1,0 +1,12 @@
+.env
+.DS_Store
+__pycache__
+venv
+stock-screener-polygon.sublime-workspace
+*.code-workspace
+.vscode
+.env.example
+*.db
+*.db-wal
+*.db-shm
+*.log
