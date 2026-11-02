@@ -56,7 +56,23 @@ Total matching stocks: 3
 ================================================================================
 ```
 
-### 2. Custom Parameters (Optional)
+### 2. Run the Midday Momentum Screener (11:30 AM – 2:00 PM EST)
+Targets sustained intraday runners and momentum consolidations (Rules: Price $2–$10, Float <= 10M, MktCap <= $100M, Change >= +10%, Active Volume >= 500K):
+```bash
+# Demo mock data mode
+python midday_screener.py --demo
+
+# Sort by percentage change descending
+python midday_screener.py --demo --sort-by change
+
+# Free live Yahoo Finance engine
+python midday_screener.py --source yfinance
+
+# Live Polygon.io engine (with automatic fallback to yfinance on free tier 403)
+python midday_screener.py --source polygon
+```
+
+### 3. Custom Parameters (Optional)
 Tune any threshold directly via CLI flags:
 ```bash
 python screener.py --min-price 3.00 --max-price 8.00 --min-gap 10.0

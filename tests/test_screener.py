@@ -287,3 +287,45 @@ def test_yfinance_screener_rules():
     assert df.iloc[0]["Est. Float (M)"] == 5.0
     assert df.iloc[0]["Market Cap ($M)"] == 25.0
 
+
+def test_midday_boundaries():
+    """Verify MiddayScreener exact rules on boundary conditions."""
+    from midday_screener import MiddayScreener
+    screener = MiddayScreener(min_volume=500000)
+    df = screener.run(demo=True)
+
+    assert not df.empty
+    for _, row in df.iterrows():
+        price = float(row["Price"].replace("$", ""))
+        change = float(row["Today's Change %"].replace("+", "").replace("%", ""))
+        volume = int(row["Volume"].replace(",", ""))
+        mcap = float(row["Market Cap ($M)"])
+        float_m = float(row["Est. Float (M)"])
+
+        assert 2.00 <= price <= 10.00
+        assert change >= 10.0
+        assert volume >= 500000
+        assert mcap <= 100.0
+        assert float_m <= 10.0
+
+
+def test_sorting_toggles():
+    """Verify sorting toggles by volume vs change percentage in MiddayScreener."""
+    from midday_screener import MiddayScreener
+    screener = MiddayScreener(min_volume=500000)
+
+    # Test volume sort
+    df_vol = screener.run(demo=True, sort_by="volume")
+    if len(df_vol) >= 2:
+        v1 = int(df_vol.iloc[0]["Volume"].replace(",", ""))
+        v2 = int(df_vol.iloc[1]["Volume"].replace(",", ""))
+        assert v1 >= v2
+
+    # Test change % sort
+    df_change = screener.run(demo=True, sort_by="change")
+    if len(df_change) >= 2:
+        c1 = float(df_change.iloc[0]["Today's Change %"].replace("+", "").replace("%", ""))
+        c2 = float(df_change.iloc[1]["Today's Change %"].replace("+", "").replace("%", ""))
+        assert c1 >= c2
+
+
