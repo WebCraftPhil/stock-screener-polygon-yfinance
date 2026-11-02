@@ -44,9 +44,9 @@ logger = logging.getLogger("PolygonScreener")
 
 
 class PolygonScreener:
-    """Screener for small-cap momentum stocks using Polygon.io API."""
+    """Screener for small-cap momentum stocks using Massive / Polygon.io API."""
 
-    BASE_URL = "https://api.polygon.io"
+    BASE_URL = os.getenv("MASSIVE_BASE_URL", "https://api.massive.com")
 
     def __init__(
         self,
@@ -75,6 +75,9 @@ class PolygonScreener:
         self.max_workers = max_workers
 
         self.session = self._create_resilient_session()
+        if self.api_key:
+            # Set Bearer token header in accordance with Massive documentation
+            self.session.headers.update({"Authorization": f"Bearer {self.api_key}"})
 
     def _create_resilient_session(self) -> requests.Session:
         """Create a requests session with retries for transient errors and rate limits."""

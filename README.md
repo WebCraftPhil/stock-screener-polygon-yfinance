@@ -1,6 +1,6 @@
-# Small-Cap Momentum Stock Screener (Polygon.io)
+# Small-Cap Momentum Stock Screener (Massive / Polygon.io)
 
-A Python screener utilizing the [Polygon.io](https://polygon.io) REST API to identify high-momentum small-cap stocks setting up during premarket trading.
+A Python screener utilizing the [Massive / Polygon.io REST API](https://massive.com/docs/rest/stocks/overview) to identify high-momentum small-cap stocks setting up during premarket trading.
 
 ## Screening Criteria
 
