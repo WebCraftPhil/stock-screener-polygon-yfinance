@@ -71,7 +71,7 @@ class YFinanceScreener:
         ])
 
         try:
-            res = yf.screen(query)
+            res = yf.screen(query, size=250)
             quotes = res.get("quotes", [])
             logger.info(f"Retrieved {len(quotes)} candidate quote(s) from Yahoo Finance.")
             return quotes

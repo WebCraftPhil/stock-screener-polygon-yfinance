@@ -11,6 +11,8 @@ from momentum_screener import (
     PolygonScreener,
     get_mock_snapshot_data,
     get_mock_ticker_details,
+    print_screener_results,
+    run_demo,
 )
 
 
@@ -141,12 +143,10 @@ def test_fundamentals_filtering_market_cap_and_float(screener):
 
 def test_sorting_by_volume_descending(screener):
     """Ensure the final scan results are sorted by volume in descending order."""
-    snapshot = get_mock_snapshot_data()
-    candidates = screener.filter_snapshot_candidates(snapshot)
-
+    screener.fetch_all_tickers_snapshot = get_mock_snapshot_data
     screener.fetch_ticker_details = get_mock_ticker_details
-    matches = screener.enrich_and_filter_fundamentals(candidates)
-    df = pd.DataFrame(matches).sort_values(by="Volume", ascending=False).reset_index(drop=True)
+
+    df = screener.scan()
 
     volumes = df["Volume"].tolist()
     assert volumes == sorted(volumes, reverse=True)
@@ -198,6 +198,64 @@ def test_http_error_handling(screener):
     with patch.object(screener.session, "get", return_value=mock_resp_403):
         with pytest.raises(PermissionError, match="403 Forbidden"):
             screener.fetch_all_tickers_snapshot()
+
+
+def test_header_only_authentication(screener):
+    """Verify that requests use the Authorization header without apiKey query params."""
+    mock_resp = Mock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = {"tickers": []}
+
+    with patch.object(screener.session, "get", return_value=mock_resp) as mock_get:
+        screener.fetch_all_tickers_snapshot()
+        mock_get.assert_called_once_with(
+            f"{screener.BASE_URL}/v2/snapshot/locale/us/markets/stocks/tickers",
+            timeout=screener.timeout,
+        )
+        assert screener.session.headers.get("Authorization") == f"Bearer {screener.api_key}"
+
+    mock_resp_details = Mock()
+    mock_resp_details.status_code = 200
+    mock_resp_details.json.return_value = {"results": {"market_cap": 10_000_000}}
+
+    with patch.object(screener.session, "get", return_value=mock_resp_details) as mock_get:
+        screener.fetch_ticker_details("AAPL")
+        mock_get.assert_called_once_with(
+            f"{screener.BASE_URL}/v3/reference/tickers/AAPL",
+            timeout=screener.timeout,
+        )
+
+
+def test_print_screener_results_rules_header(capsys):
+    """Ensure print_screener_results displays active screener rules in the header."""
+    custom_screener = PolygonScreener(
+        api_key="TEST_KEY",
+        min_price=3.50,
+        max_price=8.50,
+        min_volume=1_000_000,
+        max_float=8_000_000,
+        max_market_cap=80_000_000,
+        min_gap_pct=10.0,
+    )
+    df = pd.DataFrame(
+        columns=["Ticker", "Price", "Gap %", "Volume", "Market Cap ($M)", "Est. Float (M)"]
+    )
+    print_screener_results(df, screener=custom_screener)
+    captured = capsys.readouterr()
+    assert "Rules: Price: $3.5-$8.5 | Vol: >=1M | Float: <=8M | MktCap: <=$80M | Gap: >=+10%" in captured.out
+
+    # Default / fallback header when screener is None
+    print_screener_results(df, screener=None)
+    captured_default = capsys.readouterr()
+    assert "Rules: Price: $2-$10 | Vol: >=500K | Float: <=10M | MktCap: <=$100M | Gap: >=+5%" in captured_default.out
+
+
+def test_run_demo_executes_shared_pipeline(capsys):
+    """Ensure run_demo executes without error and prints expected demo results."""
+    run_demo()
+    captured = capsys.readouterr()
+    assert "SMALL-CAP MOMENTUM SCREENER RESULTS" in captured.out
+    assert "Total matching stocks: 3" in captured.out
 
 
 def test_yfinance_screener_rules():

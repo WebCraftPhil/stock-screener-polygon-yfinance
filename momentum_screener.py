@@ -438,50 +438,61 @@ def get_mock_ticker_details(ticker: str) -> Optional[Dict[str, Any]]:
     return mock_db.get(ticker)
 
 
-def run_demo():
+def run_demo(screener: Optional[PolygonScreener] = None):
     """Run a simulated demonstration of the screener using mock data."""
     logger.info("Running in DEMO mode with realistic sample market data...")
-    screener = PolygonScreener(api_key="DEMO_KEY")
+    if screener is None:
+        screener = PolygonScreener(api_key="DEMO_KEY")
 
     snapshot = get_mock_snapshot_data()
     candidates = screener.filter_snapshot_candidates(snapshot)
 
-    # Enrich candidates using mock details
-    matches = []
-    for cand in candidates:
-        details = get_mock_ticker_details(cand["ticker"])
-        if not details:
-            continue
-        m_cap = details.get("market_cap")
-        fl = details.get("share_class_shares_outstanding")
-
-        if m_cap and m_cap <= screener.max_market_cap and fl and fl <= screener.max_float:
-            matches.append({
-                "Ticker": cand["ticker"],
-                "Price": cand["price"],
-                "Gap %": cand["gap_pct"],
-                "Volume": cand["volume"],
-                "Market Cap": m_cap,
-                "Est. Float": fl,
-                "Market Cap ($M)": m_cap / 1_000_000.0,
-                "Est. Float (M)": fl / 1_000_000.0,
-            })
+    screener.fetch_ticker_details = get_mock_ticker_details
+    matches = screener.enrich_and_filter_fundamentals(candidates)
 
     df = pd.DataFrame(matches)
     if not df.empty:
         df = df.sort_values(by="Volume", ascending=False).reset_index(drop=True)
+    else:
+        df = pd.DataFrame(
+            columns=["Ticker", "Price", "Gap %", "Volume", "Market Cap ($M)", "Est. Float (M)"]
+        )
 
-    print_screener_results(df)
+    print_screener_results(df, screener=screener)
 
 
-def print_screener_results(df: pd.DataFrame):
+def _format_rule_number(val: float) -> str:
+    """Format large numbers into compact K/M/B representation."""
+    if abs(val) >= 1_000_000_000:
+        num = val / 1_000_000_000
+        return f"{int(num) if num.is_integer() else num:g}B"
+    if abs(val) >= 1_000_000:
+        num = val / 1_000_000
+        return f"{int(num) if num.is_integer() else num:g}M"
+    if abs(val) >= 1_000:
+        num = val / 1_000
+        return f"{int(num) if num.is_integer() else num:g}K"
+    return f"{val:g}"
+
+
+def print_screener_results(df: pd.DataFrame, screener: Optional[PolygonScreener] = None):
     """Print the formatted DataFrame to the terminal with header decorations."""
     columns_to_show = ["Ticker", "Price", "Gap %", "Volume", "Market Cap ($M)", "Est. Float (M)"]
 
     print("\n" + "=" * 80)
     print(" " * 20 + "SMALL-CAP MOMENTUM SCREENER RESULTS")
     print("=" * 80)
-    print("Rules: Price: $2-$10 | Vol: >=500K | Float: <=10M | MktCap: <=$100M | Gap: >=+5%")
+    if screener:
+        rules_header = (
+            f"Rules: Price: ${screener.min_price:g}-${screener.max_price:g} | "
+            f"Vol: >={_format_rule_number(screener.min_volume)} | "
+            f"Float: <={_format_rule_number(screener.max_float)} | "
+            f"MktCap: <=${_format_rule_number(screener.max_market_cap)} | "
+            f"Gap: >={screener.min_gap_pct:+g}%"
+        )
+    else:
+        rules_header = "Rules: Price: $2-$10 | Vol: >=500K | Float: <=10M | MktCap: <=$100M | Gap: >=+5%"
+    print(rules_header)
     print("-" * 80)
 
     if df.empty:
@@ -564,8 +575,19 @@ def main():
 
     args = parser.parse_args()
 
+    screener = PolygonScreener(
+        api_key=args.api_key if not args.demo else (args.api_key or "DEMO_KEY"),
+        min_price=args.min_price,
+        max_price=args.max_price,
+        min_volume=args.min_volume,
+        max_float=args.max_float,
+        max_market_cap=args.max_market_cap,
+        min_gap_pct=args.min_gap,
+        max_workers=args.workers,
+    )
+
     if args.demo:
-        run_demo()
+        run_demo(screener=screener)
         return
 
     if not args.api_key:
@@ -583,18 +605,8 @@ def main():
         sys.exit(1)
 
     try:
-        screener = PolygonScreener(
-            api_key=args.api_key,
-            min_price=args.min_price,
-            max_price=args.max_price,
-            min_volume=args.min_volume,
-            max_float=args.max_float,
-            max_market_cap=args.max_market_cap,
-            min_gap_pct=args.min_gap,
-            max_workers=args.workers,
-        )
         df = screener.scan()
-        print_screener_results(df)
+        print_screener_results(df, screener=screener)
 
     except PermissionError as pe:
         logger.error(f"Authentication / Permissions Error: {pe}")
