@@ -26,22 +26,24 @@ except ImportError:
     YFINANCE_AVAILABLE = False
 
 DEMO_DATA = [
-    {"ticker": "RONI", "price": 4.55, "change_pct": 14.20, "volume": 850000, "market_cap": 42000000, "float": 6200000},
-    {"ticker": "APEX", "price": 3.10, "change_pct": 22.50, "volume": 1420000, "market_cap": 28000000, "float": 4500000},
-    {"ticker": "ZGNL", "price": 7.80, "change_pct": 11.10, "volume": 620000, "market_cap": 75000000, "float": 8900000},
-    {"ticker": "VORT", "price": 2.45, "change_pct": 35.80, "volume": 3100000, "market_cap": 19000000, "float": 3100000},
-    {"ticker": "BLZE", "price": 6.20, "change_pct": 8.50, "volume": 400000, "market_cap": 54000000, "float": 7200000},  # Should be filtered out (change < 10% & vol < 500k)
+    {"ticker": "RONI", "price": 4.55, "change_pct": 14.20, "volume": 850000, "avg_volume": 100000, "market_cap": 42000000, "float": 6200000},  # rvol = 8.5x
+    {"ticker": "APEX", "price": 3.10, "change_pct": 22.50, "volume": 1420000, "avg_volume": 200000, "market_cap": 28000000, "float": 4500000},  # rvol = 7.1x
+    {"ticker": "ZGNL", "price": 7.80, "change_pct": 11.10, "volume": 620000, "avg_volume": 100000, "market_cap": 75000000, "float": 8900000},  # rvol = 6.2x
+    {"ticker": "VORT", "price": 2.45, "change_pct": 35.80, "volume": 3100000, "avg_volume": 250000, "market_cap": 19000000, "float": 3100000},  # rvol = 12.4x
+    {"ticker": "BLZE", "price": 6.20, "change_pct": 8.50, "volume": 400000, "avg_volume": 200000, "market_cap": 54000000, "float": 7200000},  # Filtered out (change < 10% & rvol < 5x)
+    {"ticker": "SLOW", "price": 5.00, "change_pct": 15.00, "volume": 300000, "avg_volume": 150000, "market_cap": 30000000, "float": 5000000},  # Filtered out (rvol = 2.0x < 5.0x)
 ]
 
 
 class MiddayScreener:
-    def __init__(self, api_key=None, min_volume=500000, source="polygon"):
+    def __init__(self, api_key=None, min_volume=500000, min_rvol=5.0, source="polygon"):
         self.api_key = (
             api_key
             or os.getenv("MASSIVE_API_KEY")
             or os.getenv("POLYGON_API_KEY")
         )
         self.min_volume = min_volume
+        self.min_rvol = min_rvol
         self.source = source
 
     def fetch_polygon_data(self):
@@ -88,6 +90,7 @@ class MiddayScreener:
                 "price": price,
                 "change_pct": round(change_pct, 2),
                 "volume": volume,
+                "avg_volume": prev_day.get("v") or 100000,
                 "market_cap": 0,  # Enriched via reference call
                 "float": 0,
             })
@@ -118,12 +121,14 @@ class MiddayScreener:
                 change_pct = ((curr_price - prev_close) / prev_close) * 100
                 market_cap = info.get("marketCap", 50000000)
                 shares_out = info.get("floatShares") or info.get("sharesOutstanding", 5000000)
+                avg_vol = info.get("averageVolume10days") or info.get("averageVolume") or 100000
 
                 results.append({
                     "ticker": symbol,
                     "price": round(curr_price, 2),
                     "change_pct": round(change_pct, 2),
                     "volume": volume,
+                    "avg_volume": avg_vol,
                     "market_cap": market_cap,
                     "float": shares_out,
                 })
@@ -151,13 +156,14 @@ class MiddayScreener:
         for item in raw_data:
             price = item.get("price", 0)
             change_pct = item.get("change_pct", 0)
-            volume = item.get("volume", 0)
+            current_volume = item.get("volume", 0)
+            avg_baseline_volume = item.get("avg_volume", 100000)  # 10-day baseline historical average
 
-            # Apply Exact Screening Rules
-            # Current Price: $2.00 - $10.00
-            # Today's Change %: >= +10%
-            # Active Intraday Volume: >= min_volume
-            if (2.00 <= price <= 10.00) and (change_pct >= 10.0) and (volume >= self.min_volume):
+            # Calculate Relative Volume multiplier
+            rvol = current_volume / avg_baseline_volume if avg_baseline_volume > 0 else 0
+
+            # Apply exact rules including 5x RVOL
+            if (2.00 <= price <= 10.00) and (change_pct >= 10.0) and (rvol >= self.min_rvol):
                 enriched = self.enrich_ticker(item)
 
                 # Fundamental Rules: Float <= 10M, Market Cap <= $100M
@@ -167,17 +173,24 @@ class MiddayScreener:
                         "Price": f"${enriched['price']:.2f}",
                         "Today's Change %": f"+{enriched['change_pct']:.2f}%" if enriched['change_pct'] >= 0 else f"{enriched['change_pct']:.2f}%",
                         "Volume": f"{enriched['volume']:,}",
+                        "RVOL": f"{rvol:.1f}x",
                         "Market Cap ($M)": round(enriched['market_cap'] / 1_000_000, 2),
                         "Est. Float (M)": round(enriched['float'] / 1_000_000, 2),
                         "_raw_volume": enriched['volume'],
                         "_raw_change": enriched['change_pct'],
+                        "_raw_rvol": rvol,
                     })
 
         df = pd.DataFrame(filtered)
         if not df.empty:
-            sort_col = "_raw_volume" if sort_by == "volume" else "_raw_change"
+            if sort_by == "change":
+                sort_col = "_raw_change"
+            elif sort_by == "rvol":
+                sort_col = "_raw_rvol"
+            else:
+                sort_col = "_raw_volume"
             df = df.sort_values(by=sort_col, ascending=False)
-            df = df.drop(columns=["_raw_volume", "_raw_change"])
+            df = df.drop(columns=["_raw_volume", "_raw_change", "_raw_rvol"])
 
         return df
 
@@ -187,7 +200,8 @@ if __name__ == "__main__":
     parser.add_argument("--demo", action="store_true", help="Run with mock midday market data")
     parser.add_argument("--source", type=str, default="polygon", choices=["polygon", "yfinance"], help="Data engine source")
     parser.add_argument("--min-volume", type=int, default=500000, help="Minimum active intraday volume")
-    parser.add_argument("--sort-by", type=str, default="volume", choices=["volume", "change"], help="Sort order: volume or change")
+    parser.add_argument("--min-rvol", type=float, default=5.0, help="Minimum Relative Volume (RVOL) multiplier (default: 5.0x)")
+    parser.add_argument("--sort-by", type=str, default="volume", choices=["volume", "change", "rvol"], help="Sort order: volume, change, or rvol")
     parser.add_argument(
         "-k",
         "--api-key",
@@ -198,7 +212,12 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    screener = MiddayScreener(api_key=args.api_key, min_volume=args.min_volume, source=args.source)
+    screener = MiddayScreener(
+        api_key=args.api_key,
+        min_volume=args.min_volume,
+        min_rvol=args.min_rvol,
+        source=args.source,
+    )
     df_result = screener.run(demo=args.demo, sort_by=args.sort_by)
 
     print("\n=== MIDDAY MOMENTUM WATCHLIST ===")

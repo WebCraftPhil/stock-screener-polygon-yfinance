@@ -447,8 +447,12 @@ def run_demo(screener: Optional[PolygonScreener] = None):
     snapshot = get_mock_snapshot_data()
     candidates = screener.filter_snapshot_candidates(snapshot)
 
-    screener.fetch_ticker_details = get_mock_ticker_details
-    matches = screener.enrich_and_filter_fundamentals(candidates)
+    original_fetch = screener.fetch_ticker_details
+    try:
+        screener.fetch_ticker_details = get_mock_ticker_details
+        matches = screener.enrich_and_filter_fundamentals(candidates)
+    finally:
+        screener.fetch_ticker_details = original_fetch
 
     df = pd.DataFrame(matches)
     if not df.empty:
@@ -462,17 +466,19 @@ def run_demo(screener: Optional[PolygonScreener] = None):
 
 
 def _format_rule_number(val: float) -> str:
-    """Format large numbers into compact K/M/B representation."""
-    if abs(val) >= 1_000_000_000:
-        num = val / 1_000_000_000
-        return f"{int(num) if num.is_integer() else num:g}B"
-    if abs(val) >= 1_000_000:
-        num = val / 1_000_000
-        return f"{int(num) if num.is_integer() else num:g}M"
-    if abs(val) >= 1_000:
-        num = val / 1_000
-        return f"{int(num) if num.is_integer() else num:g}K"
-    return f"{val:g}"
+    """Format large numbers into compact K/M/B representation while preserving exact values."""
+    for unit_val, suffix in [(1_000_000_000, "B"), (1_000_000, "M"), (1_000, "K")]:
+        if abs(val) >= unit_val:
+            num = val / unit_val
+            # Use enough significant digits to round-trip without precision loss
+            formatted_num = f"{int(num)}" if num.is_integer() else f"{num:.10g}"
+            try:
+                if round(float(formatted_num) * unit_val, 6) == round(val, 6):
+                    return f"{formatted_num}{suffix}"
+            except (ValueError, OverflowError):
+                pass
+            return f"{int(val)}" if float(val).is_integer() else f"{val:.10g}"
+    return f"{int(val)}" if float(val).is_integer() else f"{val:.10g}"
 
 
 def print_screener_results(df: pd.DataFrame, screener: Optional[PolygonScreener] = None):
@@ -484,11 +490,11 @@ def print_screener_results(df: pd.DataFrame, screener: Optional[PolygonScreener]
     print("=" * 80)
     if screener:
         rules_header = (
-            f"Rules: Price: ${screener.min_price:g}-${screener.max_price:g} | "
+            f"Rules: Price: ${screener.min_price:.10g}-${screener.max_price:.10g} | "
             f"Vol: >={_format_rule_number(screener.min_volume)} | "
             f"Float: <={_format_rule_number(screener.max_float)} | "
             f"MktCap: <=${_format_rule_number(screener.max_market_cap)} | "
-            f"Gap: >={screener.min_gap_pct:+g}%"
+            f"Gap: >={screener.min_gap_pct:+.10g}%"
         )
     else:
         rules_header = "Rules: Price: $2-$10 | Vol: >=500K | Float: <=10M | MktCap: <=$100M | Gap: >=+5%"

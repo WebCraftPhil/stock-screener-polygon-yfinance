@@ -57,10 +57,13 @@ Total matching stocks: 3
 ```
 
 ### 2. Run the Midday Momentum Screener (11:30 AM – 2:00 PM EST)
-Targets sustained intraday runners and momentum consolidations (Rules: Price $2–$10, Float <= 10M, MktCap <= $100M, Change >= +10%, Active Volume >= 500K):
+Targets sustained intraday runners and momentum consolidations (Rules: Price $2–$10, Float <= 10M, MktCap <= $100M, Change >= +10%, **RVOL >= 5.0x**):
 ```bash
 # Demo mock data mode
 python midday_screener.py --demo
+
+# Sort by Relative Volume (RVOL) descending
+python midday_screener.py --demo --sort-by rvol
 
 # Sort by percentage change descending
 python midday_screener.py --demo --sort-by change

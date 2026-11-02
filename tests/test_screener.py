@@ -289,21 +289,28 @@ def test_yfinance_screener_rules():
 
 
 def test_midday_boundaries():
-    """Verify MiddayScreener exact rules on boundary conditions."""
+    """Verify MiddayScreener exact rules on boundary conditions including 5x RVOL."""
     from midday_screener import MiddayScreener
-    screener = MiddayScreener(min_volume=500000)
+    screener = MiddayScreener(min_volume=500000, min_rvol=5.0)
     df = screener.run(demo=True)
 
     assert not df.empty
+    tickers = df["Ticker"].tolist()
+    # BLZE (change < 10% & rvol 2.0x) and SLOW (rvol 2.0x) should be excluded
+    assert "BLZE" not in tickers
+    assert "SLOW" not in tickers
+
     for _, row in df.iterrows():
         price = float(row["Price"].replace("$", ""))
         change = float(row["Today's Change %"].replace("+", "").replace("%", ""))
         volume = int(row["Volume"].replace(",", ""))
+        rvol = float(row["RVOL"].replace("x", ""))
         mcap = float(row["Market Cap ($M)"])
         float_m = float(row["Est. Float (M)"])
 
         assert 2.00 <= price <= 10.00
         assert change >= 10.0
+        assert rvol >= 5.0
         assert volume >= 500000
         assert mcap <= 100.0
         assert float_m <= 10.0
