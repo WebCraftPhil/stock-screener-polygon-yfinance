@@ -336,3 +336,85 @@ def test_sorting_toggles():
         assert c1 >= c2
 
 
+def test_midday_polygon_auth_and_safe_error():
+    """Verify MiddayScreener uses Bearer header and sanitizes errors."""
+    from midday_screener import MiddayScreener
+    test_key = "SECRET_API_KEY_999"
+    screener = MiddayScreener(api_key=test_key, source="polygon")
+
+    with patch("requests.get") as mock_get:
+        mock_resp = Mock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"tickers": []}
+        mock_get.return_value = mock_resp
+
+        res = screener.fetch_polygon_data()
+        assert res == []
+        mock_get.assert_called_once()
+        url = mock_get.call_args[0][0]
+        assert "apiKey=" not in url
+        headers = mock_get.call_args[1].get("headers", {})
+        assert headers.get("Authorization") == f"Bearer {test_key}"
+
+    # Verify connection error does not expose the secret
+    with patch("requests.get", side_effect=ConnectionError(f"Failed to connect: {test_key}")):
+        res_err = screener.fetch_polygon_data()
+        assert res_err == []
+        assert screener.last_status == "failed"
+        assert test_key not in screener.last_error
+        assert "[REDACTED]" in screener.last_error
+
+
+def test_midday_live_failure_never_returns_demo_data():
+    """Verify live fetch failures never fall back to DEMO_DATA unless demo=True."""
+    from midday_screener import MiddayScreener
+    with patch.dict("os.environ", {}, clear=True):
+        screener_no_key = MiddayScreener(api_key=None, source="polygon")
+        screener_no_key.api_key = None
+        df = screener_no_key.run(demo=False)
+        assert df.empty
+        assert screener_no_key.last_status == "failed"
+        assert "No Polygon API key provided" in screener_no_key.last_error
+
+
+def test_midday_fundamentals_normalization_and_exclusion():
+    """Verify candidates with missing/None market cap or float are excluded."""
+    from midday_screener import MiddayScreener
+    screener = MiddayScreener(api_key="TEST_KEY", source="yfinance")
+
+    raw_items = [
+        # Pass: all criteria met
+        {"ticker": "PASS", "price": 5.0, "change_pct": 15.0, "volume": 1_000_000, "avg_volume": 100_000, "market_cap": 25_000_000, "float": 5_000_000},
+        # Fail: market_cap is None
+        {"ticker": "NOMCAP", "price": 5.0, "change_pct": 15.0, "volume": 1_000_000, "avg_volume": 100_000, "market_cap": None, "float": 5_000_000},
+        # Fail: float is None
+        {"ticker": "NOFLOAT", "price": 5.0, "change_pct": 15.0, "volume": 1_000_000, "avg_volume": 100_000, "market_cap": 25_000_000, "float": None},
+    ]
+
+    screener.fetch_yfinance_data = lambda: raw_items
+    df = screener.run(demo=False)
+    assert len(df) == 1
+    assert df.iloc[0]["Ticker"] == "PASS"
+
+
+def test_run_demo_restores_fetch_ticker_details():
+    """Verify run_demo restores the screener's original fetch_ticker_details method."""
+    screener = PolygonScreener(api_key="TEST_KEY")
+    orig_method = screener.fetch_ticker_details
+    run_demo(screener=screener)
+    assert screener.fetch_ticker_details == orig_method
+
+
+def test_format_rule_number_preserves_exact_values():
+    """Verify _format_rule_number preserves exact limits without loss of precision."""
+    from momentum_screener import _format_rule_number
+    assert _format_rule_number(500_000) == "500K"
+    assert _format_rule_number(10_000_000) == "10M"
+    assert _format_rule_number(100_000_000) == "100M"
+    assert _format_rule_number(10_500_000) == "10.5M"
+    assert _format_rule_number(10_000_001) == "10.000001M"
+    # When compact representation cannot round-trip exactly, full value is shown
+    assert _format_rule_number(10_000_000_000_001) == "10000000000001"
+
+
+

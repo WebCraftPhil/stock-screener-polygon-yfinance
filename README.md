@@ -71,8 +71,9 @@ python midday_screener.py --demo --sort-by change
 # Free live Yahoo Finance engine
 python midday_screener.py --source yfinance
 
-# Live Polygon.io engine (with automatic fallback to yfinance on free tier 403)
-python midday_screener.py --source polygon
+# Live Polygon.io engine (requires setting MASSIVE_API_KEY or POLYGON_API_KEY in .env/environment, or passing --api-key):
+python midday_screener.py --source polygon --api-key "your_api_key_here"
+# (or `python midday_screener.py --source polygon` if configured in .env)
 ```
 
 ### 3. Custom Parameters (Optional)

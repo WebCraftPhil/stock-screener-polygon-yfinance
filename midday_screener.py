@@ -45,18 +45,26 @@ class MiddayScreener:
         self.min_volume = min_volume
         self.min_rvol = min_rvol
         self.source = source
+        self.last_error = None
+        self.last_status = "ok"
 
     def fetch_polygon_data(self):
         if not self.api_key:
-            print("[!] No Polygon API key provided. Falling back to --demo mode.")
-            return DEMO_DATA
+            self.last_status = "failed"
+            self.last_error = "No Polygon API key provided. Set MASSIVE_API_KEY or POLYGON_API_KEY, or pass --api-key."
+            print(f"[!] {self.last_error}")
+            return []
 
-        url = f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers?apiKey={self.api_key}"
+        url = "https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers"
+        headers = {"Authorization": f"Bearer {self.api_key}"}
         try:
-            response = requests.get(url, timeout=15)
+            response = requests.get(url, headers=headers, timeout=15)
         except requests.exceptions.RequestException as e:
-            print(f"[!] Polygon API Connection Error: {e}. Falling back to demo data.")
-            return DEMO_DATA
+            safe_err = str(e).replace(self.api_key, "[REDACTED]") if self.api_key else str(e)
+            self.last_status = "failed"
+            self.last_error = f"Polygon API Connection Error: {safe_err}"
+            print(f"[!] {self.last_error}")
+            return []
 
         if response.status_code == 403:
             print("[!] Polygon API returned 403 Forbidden (Starter/Developer tier required for snapshots).")
@@ -64,11 +72,15 @@ class MiddayScreener:
                 print("[*] Automatically falling back to Yahoo Finance live engine (--source yfinance)...")
                 return self.fetch_yfinance_data()
             else:
-                print("[!] yfinance not installed. Falling back to --demo data.")
-                return DEMO_DATA
+                self.last_status = "failed"
+                self.last_error = "Polygon API returned 403 Forbidden and yfinance is not available."
+                print(f"[!] {self.last_error}")
+                return []
         elif response.status_code != 200:
-            print(f"[!] Polygon API Error: {response.status_code}. Using demo data.")
-            return DEMO_DATA
+            self.last_status = "failed"
+            self.last_error = f"Polygon API Error: HTTP {response.status_code}."
+            print(f"[!] {self.last_error}")
+            return []
 
         tickers = response.json().get("tickers", [])
         parsed = []
@@ -91,15 +103,17 @@ class MiddayScreener:
                 "change_pct": round(change_pct, 2),
                 "volume": volume,
                 "avg_volume": prev_day.get("v") or 100000,
-                "market_cap": 0,  # Enriched via reference call
-                "float": 0,
+                "market_cap": None,  # Enriched via reference call
+                "float": None,
             })
         return parsed
 
     def fetch_yfinance_data(self):
         if not YFINANCE_AVAILABLE:
-            print("[!] yfinance package is required for live Yahoo Finance data. Run: pip install yfinance")
-            sys.exit(1)
+            self.last_status = "failed"
+            self.last_error = "yfinance package is required for live Yahoo Finance data."
+            print(f"[!] {self.last_error} Run: pip install yfinance")
+            return []
 
         print("[*] Fetching live small-cap active symbols via Yahoo Finance...")
         # Curated active small-cap test basket for free engine illustration
@@ -119,8 +133,8 @@ class MiddayScreener:
                 curr_price = hist['Close'].iloc[-1]
                 volume = int(hist['Volume'].iloc[-1])
                 change_pct = ((curr_price - prev_close) / prev_close) * 100
-                market_cap = info.get("marketCap", 50000000)
-                shares_out = info.get("floatShares") or info.get("sharesOutstanding", 5000000)
+                market_cap = info.get("marketCap")
+                shares_out = info.get("floatShares")
                 avg_vol = info.get("averageVolume10days") or info.get("averageVolume") or 100000
 
                 results.append({
@@ -134,17 +148,57 @@ class MiddayScreener:
                 })
             except Exception:
                 continue
-        return results if results else DEMO_DATA
+        return results
+
+    def fetch_polygon_ticker_details(self, ticker: str):
+        if not self.api_key:
+            return None
+        url = f"https://api.polygon.io/v3/reference/tickers/{ticker}"
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+        try:
+            resp = requests.get(url, headers=headers, timeout=10)
+            if resp.status_code == 200:
+                return resp.json().get("results", {})
+        except requests.exceptions.RequestException:
+            pass
+        return None
 
     def enrich_ticker(self, item):
-        # If market_cap or float is missing/zero, assign reasonable defaults or fetch
-        if item.get("market_cap", 0) == 0:
-            item["market_cap"] = 45000000
-        if item.get("float", 0) == 0:
-            item["float"] = 5500000
+        ticker = item.get("ticker")
+        market_cap = item.get("market_cap")
+        float_shares = item.get("float")
+
+        # If fundamentals are not populated and we are using Polygon, fetch reference data
+        if (market_cap is None or float_shares is None) and self.api_key and self.source == "polygon":
+            details = self.fetch_polygon_ticker_details(ticker)
+            if details:
+                if market_cap is None:
+                    market_cap = details.get("market_cap")
+                if float_shares is None:
+                    float_shares = (
+                        details.get("free_float")
+                        or details.get("float")
+                        or details.get("share_class_shares_outstanding")
+                        or details.get("weighted_shares_outstanding")
+                    )
+
+        # Normalize None or invalid values
+        try:
+            item["market_cap"] = float(market_cap) if market_cap is not None else None
+        except (ValueError, TypeError):
+            item["market_cap"] = None
+
+        try:
+            item["float"] = float(float_shares) if float_shares is not None else None
+        except (ValueError, TypeError):
+            item["float"] = None
+
         return item
 
     def run(self, demo=False, sort_by="volume"):
+        self.last_error = None
+        self.last_status = "ok"
+
         if demo:
             raw_data = DEMO_DATA
         elif self.source == "yfinance":
@@ -154,32 +208,37 @@ class MiddayScreener:
 
         filtered = []
         for item in raw_data:
-            price = item.get("price", 0)
-            change_pct = item.get("change_pct", 0)
-            current_volume = item.get("volume", 0)
-            avg_baseline_volume = item.get("avg_volume", 100000)  # 10-day baseline historical average
+            price = item.get("price") or 0
+            change_pct = item.get("change_pct") or 0
+            current_volume = item.get("volume") or 0
+            avg_baseline_volume = item.get("avg_volume") or 100000  # 10-day baseline historical average
 
             # Calculate Relative Volume multiplier
             rvol = current_volume / avg_baseline_volume if avg_baseline_volume > 0 else 0
 
-            # Apply exact rules including 5x RVOL
-            if (2.00 <= price <= 10.00) and (change_pct >= 10.0) and (rvol >= self.min_rvol):
+            # Apply exact rules including price, change, volume, and 5x RVOL
+            if (2.00 <= price <= 10.00) and (change_pct >= 10.0) and (current_volume >= self.min_volume) and (rvol >= self.min_rvol):
                 enriched = self.enrich_ticker(item)
 
+                mcap = enriched.get("market_cap")
+                fl = enriched.get("float")
+
                 # Fundamental Rules: Float <= 10M, Market Cap <= $100M
-                if enriched["float"] <= 10000000 and enriched["market_cap"] <= 100000000:
-                    filtered.append({
-                        "Ticker": enriched["ticker"],
-                        "Price": f"${enriched['price']:.2f}",
-                        "Today's Change %": f"+{enriched['change_pct']:.2f}%" if enriched['change_pct'] >= 0 else f"{enriched['change_pct']:.2f}%",
-                        "Volume": f"{enriched['volume']:,}",
-                        "RVOL": f"{rvol:.1f}x",
-                        "Market Cap ($M)": round(enriched['market_cap'] / 1_000_000, 2),
-                        "Est. Float (M)": round(enriched['float'] / 1_000_000, 2),
-                        "_raw_volume": enriched['volume'],
-                        "_raw_change": enriched['change_pct'],
-                        "_raw_rvol": rvol,
-                    })
+                # Candidates with unknown fundamentals are excluded
+                if mcap is not None and fl is not None:
+                    if fl <= 10000000 and mcap <= 100000000:
+                        filtered.append({
+                            "Ticker": enriched["ticker"],
+                            "Price": f"${enriched['price']:.2f}",
+                            "Today's Change %": f"+{enriched['change_pct']:.2f}%" if enriched['change_pct'] >= 0 else f"{enriched['change_pct']:.2f}%",
+                            "Volume": f"{enriched['volume']:,}",
+                            "RVOL": f"{rvol:.1f}x",
+                            "Market Cap ($M)": round(enriched['market_cap'] / 1_000_000, 2),
+                            "Est. Float (M)": round(enriched['float'] / 1_000_000, 2),
+                            "_raw_volume": enriched['volume'],
+                            "_raw_change": enriched['change_pct'],
+                            "_raw_rvol": rvol,
+                        })
 
         df = pd.DataFrame(filtered)
         if not df.empty:
@@ -221,7 +280,9 @@ if __name__ == "__main__":
     df_result = screener.run(demo=args.demo, sort_by=args.sort_by)
 
     print("\n=== MIDDAY MOMENTUM WATCHLIST ===")
-    if not df_result.empty:
+    if screener.last_error and not args.demo:
+        print(f"[ERROR] Live scan failed: {screener.last_error}")
+    elif not df_result.empty:
         print(df_result.to_string(index=False))
     else:
         print("No stocks currently match the exact midday momentum criteria.")
