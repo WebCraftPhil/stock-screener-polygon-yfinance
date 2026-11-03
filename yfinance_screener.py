@@ -18,6 +18,9 @@ sorts by volume in descending order, and displays a formatted Pandas DataFrame.
 import sys
 import logging
 import argparse
+import math
+from datetime import datetime, timezone
+from market_data import market_session
 from typing import List, Dict, Any, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -45,6 +48,7 @@ class YFinanceScreener:
         max_market_cap: float = 100_000_000,
         min_gap_pct: float = 5.0,
         max_workers: int = 6,
+        float_mode: str = "strict",
     ):
         self.min_price = min_price
         self.max_price = max_price
@@ -53,6 +57,7 @@ class YFinanceScreener:
         self.max_market_cap = max_market_cap
         self.min_gap_pct = min_gap_pct
         self.max_workers = max_workers
+        self.float_mode = float_mode
 
     def fetch_candidates(self) -> List[Dict[str, Any]]:
         """
@@ -84,11 +89,15 @@ class YFinanceScreener:
         try:
             ticker = yf.Ticker(symbol)
             info = ticker.info or {}
-            float_shares = info.get("floatShares") or info.get("sharesOutstanding")
+            float_shares = info.get("floatShares")
             market_cap = info.get("marketCap")
             return {
                 "float_shares": float_shares,
+                "shares_outstanding": info.get("sharesOutstanding"),
                 "market_cap": market_cap,
+                "float_source": "Yahoo Finance floatShares" if float_shares is not None else None,
+                # Yahoo does not expose a dependable timestamp for this float field.
+                "float_timestamp": None,
             }
         except Exception as e:
             logger.debug(f"Could not fetch info for {symbol}: {e}")
@@ -100,7 +109,7 @@ class YFinanceScreener:
         if not quotes:
             logger.info("No stocks matched the initial screener query.")
             return pd.DataFrame(
-                columns=["Ticker", "Price", "Gap %", "Volume", "Market Cap ($M)", "Est. Float (M)"]
+                columns=["Ticker", "Price", "Gap %", "Volume", "Market Cap ($M)", "Float (M)"]
             )
 
         logger.info(f"Checking float and market cap fundamentals for {len(quotes)} candidate(s)...")
@@ -112,9 +121,11 @@ class YFinanceScreener:
             if not symbol or "." in symbol:
                 return None
 
-            price = q.get("regularMarketPrice") or q.get("preMarketPrice")
-            gap_pct = q.get("regularMarketChangePercent") or q.get("preMarketChangePercent")
-            volume = q.get("regularMarketVolume") or q.get("preMarketVolume") or 0
+            # Yahoo quote discovery is not a reliable extended-hours tape. Use its
+            # regular-session fields explicitly; never relabel them premarket.
+            price = q.get("regularMarketPrice")
+            gap_pct = q.get("regularMarketChangePercent")
+            volume = q.get("regularMarketVolume")
             m_cap = q.get("marketCap")
 
             if not price or price < self.min_price or price > self.max_price:
@@ -122,6 +133,11 @@ class YFinanceScreener:
             if gap_pct is None or gap_pct < self.min_gap_pct:
                 return None
             if volume < self.min_volume:
+                return None
+            quote_epoch = q.get("regularMarketTime")
+            quote_dt = datetime.fromtimestamp(quote_epoch, timezone.utc) if quote_epoch else None
+            if quote_dt and (datetime.now(timezone.utc) - quote_dt).total_seconds() > 15 * 60:
+                logger.warning("Skipping stale Yahoo quote for %s (timestamp %s).", symbol, quote_dt.isoformat())
                 return None
 
             # Fetch float details
@@ -132,20 +148,16 @@ class YFinanceScreener:
             if not m_cap:
                 m_cap = fundamentals.get("market_cap")
 
-            # Fallback estimation if float is missing but market cap is present
-            if float_shares is None and m_cap and price > 0:
-                float_shares = m_cap / price
-
-            # Fallback estimation if market cap is missing but float is present
-            if m_cap is None and float_shares and price > 0:
-                m_cap = float_shares * price
+            valid_float = isinstance(float_shares, (int, float)) and math.isfinite(float_shares) and float_shares > 0
 
             # Enforce Market Cap <= $100M
-            if m_cap is None or m_cap > self.max_market_cap:
+            if not isinstance(m_cap, (int, float)) or not math.isfinite(m_cap) or m_cap <= 0 or m_cap > self.max_market_cap:
                 return None
 
             # Enforce Float <= 10M shares
-            if float_shares is None or float_shares > self.max_float:
+            if not valid_float and self.float_mode == "strict":
+                return None
+            if valid_float and float_shares > self.max_float:
                 return None
 
             return {
@@ -154,9 +166,18 @@ class YFinanceScreener:
                 "Gap %": float(gap_pct),
                 "Volume": int(volume),
                 "Market Cap": float(m_cap),
-                "Est. Float": float(float_shares),
+                "Float": float(float_shares) if valid_float else None,
+                "Shares Outstanding": fundamentals.get("shares_outstanding"),
+                "Float Status": "verified" if valid_float else "unverified",
+                "Float Source": fundamentals.get("float_source"),
+                "Float Timestamp": fundamentals.get("float_timestamp"),
+                "Session": market_session(quote_dt) if quote_dt else "regular (Yahoo field)",
+                "Quote Timestamp": quote_dt.isoformat() if quote_dt else None,
+                "Data Freshness": "timestamped" if quote_dt else "unknown",
+                "Premarket Volume": None,
+                "Regular Volume": int(volume),
                 "Market Cap ($M)": float(m_cap) / 1_000_000.0,
-                "Est. Float (M)": float(float_shares) / 1_000_000.0,
+                "Float (M)": float(float_shares) / 1_000_000.0 if valid_float else None,
             }
 
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
@@ -169,7 +190,7 @@ class YFinanceScreener:
         if not matching_stocks:
             logger.info("No stocks matched all criteria after float and market cap verification.")
             return pd.DataFrame(
-                columns=["Ticker", "Price", "Gap %", "Volume", "Market Cap ($M)", "Est. Float (M)"]
+                columns=["Ticker", "Price", "Gap %", "Volume", "Market Cap ($M)", "Float (M)"]
             )
 
         df = pd.DataFrame(matching_stocks)
@@ -189,13 +210,13 @@ class YFinanceScreener:
         display_df["Gap %"] = df["Gap %"].apply(lambda g: f"{g:+.2f}%")
         display_df["Volume"] = df["Volume"].apply(lambda v: f"{int(v):,}")
         display_df["Market Cap ($M)"] = df["Market Cap ($M)"].apply(lambda mc: f"${mc:,.2f}")
-        display_df["Est. Float (M)"] = df["Est. Float (M)"].apply(lambda fl: f"{fl:,.2f}")
+        display_df["Float (M)"] = df["Float (M)"].apply(lambda fl: f"{fl:,.2f}" if pd.notna(fl) else "N/A")
         return display_df
 
 
 def print_screener_results(df: pd.DataFrame):
     """Print the formatted DataFrame to the terminal with header decorations."""
-    columns_to_show = ["Ticker", "Price", "Gap %", "Volume", "Market Cap ($M)", "Est. Float (M)"]
+    columns_to_show = ["Ticker", "Price", "Gap %", "Volume", "Market Cap ($M)", "Float (M)"]
 
     print("\n" + "=" * 80)
     print(" " * 16 + "SMALL-CAP MOMENTUM SCREENER (YAHOO FINANCE)")
@@ -266,6 +287,7 @@ def main():
         default=6,
         help="Max worker threads (default: 6)",
     )
+    parser.add_argument("--float-mode", choices=["strict", "discovery"], default="strict", help="Exclude unknown public float (strict) or include and flag it (discovery)")
 
     args = parser.parse_args()
 
@@ -277,6 +299,7 @@ def main():
         max_market_cap=args.max_market_cap,
         min_gap_pct=args.min_gap,
         max_workers=args.workers,
+        float_mode=args.float_mode,
     )
     df = screener.scan()
     print_screener_results(df)

@@ -118,16 +118,19 @@ def test_fundamentals_filtering_market_cap_and_float(screener):
         if ticker == "PASS_ALL":
             return {
                 "market_cap": 25_000_000,
+                "free_float": 5_250_000,
                 "share_class_shares_outstanding": 6_250_000,
             }
         elif ticker == "FAIL_MCAP":
             return {
                 "market_cap": 150_000_000,  # Exceeds $100M
+                "free_float": 7_000_000,
                 "share_class_shares_outstanding": 8_000_000,
             }
         elif ticker == "FAIL_FLOAT":
             return {
                 "market_cap": 36_000_000,
+                "free_float": 12_000_000,
                 "share_class_shares_outstanding": 12_000_000,  # Exceeds 10M
             }
         return None
@@ -138,7 +141,7 @@ def test_fundamentals_filtering_market_cap_and_float(screener):
     result_tickers = [r["Ticker"] for r in results]
     assert result_tickers == ["PASS_ALL"]
     assert results[0]["Market Cap ($M)"] == 25.0
-    assert results[0]["Est. Float (M)"] == 6.25
+    assert results[0]["Float (M)"] == 5.25
 
 
 def test_sorting_by_volume_descending(screener):
@@ -165,13 +168,13 @@ def test_formatted_dataframe_columns_and_values():
             "Gap %": 14.523,
             "Volume": 1850000,
             "Market Cap ($M)": 25.0,
-            "Est. Float (M)": 7.2,
+                "Float (M)": 7.2,
         }
     ])
 
     formatted = PolygonScreener.format_dataframe_for_display(raw_df)
 
-    expected_cols = ["Ticker", "Price", "Gap %", "Volume", "Market Cap ($M)", "Est. Float (M)"]
+    expected_cols = ["Ticker", "Price", "Gap %", "Volume", "Market Cap ($M)", "Float (M)"]
     assert list(formatted.columns) == expected_cols
 
     row = formatted.iloc[0]
@@ -180,7 +183,7 @@ def test_formatted_dataframe_columns_and_values():
     assert row["Gap %"] == "+14.52%"
     assert row["Volume"] == "1,850,000"
     assert row["Market Cap ($M)"] == "$25.00"
-    assert row["Est. Float (M)"] == "7.20"
+    assert row["Float (M)"] == "7.20"
 
 
 def test_http_error_handling(screener):
@@ -238,7 +241,7 @@ def test_print_screener_results_rules_header(capsys):
         min_gap_pct=10.0,
     )
     df = pd.DataFrame(
-        columns=["Ticker", "Price", "Gap %", "Volume", "Market Cap ($M)", "Est. Float (M)"]
+        columns=["Ticker", "Price", "Gap %", "Volume", "Market Cap ($M)", "Float (M)"]
     )
     print_screener_results(df, screener=custom_screener)
     captured = capsys.readouterr()
@@ -272,7 +275,7 @@ def test_yfinance_screener_rules():
     ]
 
     mock_fundamentals = {
-        "WIN1": {"float_shares": 5_000_000, "market_cap": 25_000_000},
+        "WIN1": {"float_shares": 5_000_000, "market_cap": 25_000_000, "shares_outstanding": 7_000_000},
         "FAIL_HIGH_MCAP": {"float_shares": 6_000_000, "market_cap": 150_000_000},
         "FAIL_LOW_VOL": {"float_shares": 2_000_000, "market_cap": 10_000_000},
     }
@@ -284,7 +287,7 @@ def test_yfinance_screener_rules():
     assert len(df) == 1
     assert df.iloc[0]["Ticker"] == "WIN1"
     assert df.iloc[0]["Price"] == 5.0
-    assert df.iloc[0]["Est. Float (M)"] == 5.0
+    assert df.iloc[0]["Float (M)"] == 5.0
     assert df.iloc[0]["Market Cap ($M)"] == 25.0
 
 
@@ -301,12 +304,12 @@ def test_midday_boundaries():
     assert "SLOW" not in tickers
 
     for _, row in df.iterrows():
-        price = float(row["Price"].replace("$", ""))
-        change = float(row["Today's Change %"].replace("+", "").replace("%", ""))
-        volume = int(row["Volume"].replace(",", ""))
-        rvol = float(row["RVOL"].replace("x", ""))
+        price = float(row["Price"])
+        change = float(row["Today's Change %"])
+        volume = int(row["Volume"])
+        rvol = float(row["RVOL"])
         mcap = float(row["Market Cap ($M)"])
-        float_m = float(row["Est. Float (M)"])
+        float_m = float(row["Float (M)"])
 
         assert 2.00 <= price <= 10.00
         assert change >= 10.0
@@ -324,15 +327,15 @@ def test_sorting_toggles():
     # Test volume sort
     df_vol = screener.run(demo=True, sort_by="volume")
     if len(df_vol) >= 2:
-        v1 = int(df_vol.iloc[0]["Volume"].replace(",", ""))
-        v2 = int(df_vol.iloc[1]["Volume"].replace(",", ""))
+        v1 = int(df_vol.iloc[0]["Volume"])
+        v2 = int(df_vol.iloc[1]["Volume"])
         assert v1 >= v2
 
     # Test change % sort
     df_change = screener.run(demo=True, sort_by="change")
     if len(df_change) >= 2:
-        c1 = float(df_change.iloc[0]["Today's Change %"].replace("+", "").replace("%", ""))
-        c2 = float(df_change.iloc[1]["Today's Change %"].replace("+", "").replace("%", ""))
+        c1 = float(df_change.iloc[0]["Today's Change %"])
+        c2 = float(df_change.iloc[1]["Today's Change %"])
         assert c1 >= c2
 
 
@@ -471,6 +474,76 @@ def test_midday_both_volume_and_rvol_limits_enforced():
     assert df.iloc[0]["Ticker"] == "PASS"
 
 
+def test_float_is_never_inferred_from_shares_or_market_cap(screener):
+    candidate = [{"ticker": "UNKNOWN", "price": 5, "volume": 900000, "gap_pct": 8}]
+    screener.fetch_ticker_details = lambda _: {"market_cap": 20_000_000, "share_class_shares_outstanding": 2_000_000}
+    assert screener.enrich_and_filter_fundamentals(candidate) == []
+    screener.float_mode = "discovery"
+    row = screener.enrich_and_filter_fundamentals(candidate)[0]
+    assert row["Float"] is None
+    assert row["Shares Outstanding"] == 2_000_000
+    assert row["Float Status"] == "unverified"
+
+
+@pytest.mark.parametrize("value", [0, -1, float("nan"), float("inf")])
+def test_invalid_float_is_unknown(screener, value):
+    candidate = [{"ticker": "BAD", "price": 5, "volume": 900000, "gap_pct": 8}]
+    screener.fetch_ticker_details = lambda _: {"market_cap": 20_000_000, "free_float": value}
+    assert screener.enrich_and_filter_fundamentals(candidate) == []
+
+
+def test_missing_float_and_shares_only_yahoo_discovery_mode():
+    from yfinance_screener import YFinanceScreener
+    scanner = YFinanceScreener(float_mode="discovery")
+    scanner.fetch_candidates = lambda: [{"symbol": "ABC", "regularMarketPrice": 5, "regularMarketChangePercent": 8, "regularMarketVolume": 900000, "marketCap": 20_000_000}]
+    scanner.get_ticker_float_and_mcap = lambda _: {"float_shares": None, "shares_outstanding": 1_000_000, "market_cap": 20_000_000}
+    row = scanner.scan().iloc[0]
+    assert pd.isna(row["Float"])
+    assert row["Shares Outstanding"] == 1_000_000
+    assert row["Float Status"] == "unverified"
+
+
+def test_market_session_timezone_dst_and_holiday():
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    from market_data import market_session, is_nyse_session
+    ny = ZoneInfo("America/New_York")
+    assert market_session(datetime(2026, 3, 9, 9, 0, tzinfo=ny)) == "premarket"
+    assert market_session(datetime(2026, 3, 9, 9, 30, tzinfo=ny)) == "regular"
+    assert market_session(datetime(2026, 3, 9, 17, 0, tzinfo=ny)) == "after-hours"
+    assert is_nyse_session(datetime(2026, 11, 26, 12, 0, tzinfo=ny)) is False
+
+
+def test_yahoo_does_not_substitute_premarket_quote_fields_or_use_stale_quotes():
+    from datetime import datetime, timezone
+    from yfinance_screener import YFinanceScreener
+    scanner = YFinanceScreener(float_mode="discovery")
+    scanner.fetch_candidates = lambda: [
+        {"symbol": "PRE", "preMarketPrice": 5.0, "preMarketChangePercent": 20.0, "preMarketVolume": 900000, "marketCap": 10_000_000},
+        {"symbol": "OLD", "regularMarketPrice": 5.0, "regularMarketChangePercent": 20.0, "regularMarketVolume": 900000, "regularMarketTime": 1, "marketCap": 10_000_000},
+    ]
+    scanner.get_ticker_float_and_mcap = lambda _: {"float_shares": 1_000_000, "market_cap": 10_000_000}
+    assert scanner.scan().empty
+
+
+def test_midday_missing_daily_baseline_is_not_fabricated():
+    from midday_screener import MiddayScreener
+    scanner = MiddayScreener(source="yfinance", float_mode="discovery")
+    scanner.fetch_yfinance_data = lambda: [{"ticker": "A", "price": 5, "change_pct": 20, "volume": 2_000_000, "avg_volume": None, "market_cap": 10_000_000, "float": None}]
+    assert scanner.run().empty
+
+
+def test_midday_yahoo_uses_dynamic_equity_query():
+    from midday_screener import MiddayScreener
+    scanner = MiddayScreener(source="yfinance")
+    quote = {"symbol": "NEW", "regularMarketPrice": 4.0, "regularMarketChangePercent": 15.0, "regularMarketVolume": 600_000}
+    fake_ticker = Mock(info={"marketCap": 10_000_000, "floatShares": 1_000_000, "averageVolume": 100_000})
+    with patch("midday_screener.yf.Ticker", return_value=fake_ticker), patch("midday_screener.yf.screen", return_value={"quotes": [quote]}) as screen:
+        result = scanner.fetch_yfinance_data()
+    assert result[0]["ticker"] == "NEW"
+    screen.assert_called_once()
+
+
 def test_fetch_polygon_historical_avg_volume_and_rvol_gate():
     """Verify Polygon path fetches 10-day historical daily volume average before RVOL gate."""
     from midday_screener import MiddayScreener
@@ -493,6 +566,20 @@ def test_fetch_polygon_historical_avg_volume_and_rvol_gate():
         mock_get.assert_called_once()
         url = mock_get.call_args[0][0]
         assert "/v2/aggs/ticker/TEST/range/1/day/" in url
+
+        # Verify end_date excludes today's ET date and is set to yesterday ET
+        from datetime import datetime, timedelta
+        try:
+            from zoneinfo import ZoneInfo
+            expected_yesterday = (datetime.now(ZoneInfo("America/New_York")).date() - timedelta(days=1)).strftime("%Y-%m-%d")
+            today_et = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
+        except Exception:
+            expected_yesterday = (datetime.now().date() - timedelta(days=1)).strftime("%Y-%m-%d")
+            today_et = datetime.now().strftime("%Y-%m-%d")
+
+        assert url.endswith(f"/{expected_yesterday}")
+        assert not url.endswith(f"/{today_et}")
+
         params = mock_get.call_args[1].get("params", {})
         assert params.get("limit") == 10
         assert params.get("sort") == "desc"

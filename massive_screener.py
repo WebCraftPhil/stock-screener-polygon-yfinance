@@ -18,6 +18,7 @@ import os
 import sys
 import argparse
 import logging
+import math
 from typing import List, Dict, Any, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -55,6 +56,7 @@ class MassiveMomentumScreener:
         max_market_cap: float = 100_000_000,
         min_gap_pct: float = 5.0,
         max_workers: int = 5,
+        float_mode: str = "strict",
     ):
         self.api_key = (
             api_key
@@ -74,6 +76,7 @@ class MassiveMomentumScreener:
         self.max_market_cap = max_market_cap
         self.min_gap_pct = min_gap_pct
         self.max_workers = max_workers
+        self.float_mode = float_mode
 
         self.client = RESTClient(api_key=self.api_key)
 
@@ -153,19 +156,18 @@ class MassiveMomentumScreener:
                     return None
 
                 m_cap = getattr(details, "market_cap", None)
-                float_shares = (
-                    getattr(details, "share_class_shares_outstanding", None)
-                    or getattr(details, "weighted_shares_outstanding", None)
-                )
-
-                if not m_cap and float_shares and cand["price"] > 0:
-                    m_cap = float_shares * cand["price"]
-                if not float_shares and m_cap and cand["price"] > 0:
-                    float_shares = m_cap / cand["price"]
+                float_shares = getattr(details, "free_float", None)
+                shares_outstanding = getattr(details, "share_class_shares_outstanding", None) or getattr(details, "weighted_shares_outstanding", None)
+                if not isinstance(float_shares, (int, float)) or not math.isfinite(float_shares) or float_shares <= 0:
+                    float_shares = None
+                if not isinstance(m_cap, (int, float)) or not math.isfinite(m_cap) or m_cap <= 0:
+                    m_cap = None
 
                 if m_cap is None or m_cap > self.max_market_cap:
                     return None
-                if float_shares is None or float_shares > self.max_float:
+                if float_shares is None and self.float_mode == "strict":
+                    return None
+                if float_shares is not None and float_shares > self.max_float:
                     return None
 
                 return {
@@ -174,9 +176,13 @@ class MassiveMomentumScreener:
                     "Gap %": cand["gap_pct"],
                     "Volume": cand["volume"],
                     "Market Cap": m_cap,
-                    "Est. Float": float_shares,
+                    "Float": float_shares,
+                    "Shares Outstanding": shares_outstanding,
+                    "Float Status": "verified" if float_shares is not None else "unverified",
+                    "Float Source": "Massive free_float" if float_shares is not None else None,
+                    "Float Timestamp": getattr(details, "float_last_updated", None),
                     "Market Cap ($M)": m_cap / 1_000_000.0,
-                    "Est. Float (M)": float_shares / 1_000_000.0,
+                    "Float (M)": float_shares / 1_000_000.0 if float_shares is not None else None,
                 }
             except Exception as e:
                 logger.debug(f"Failed to fetch details for {ticker}: {e}")
@@ -199,7 +205,7 @@ class MassiveMomentumScreener:
 
         if not matches:
             return pd.DataFrame(
-                columns=["Ticker", "Price", "Gap %", "Volume", "Market Cap ($M)", "Est. Float (M)"]
+                columns=["Ticker", "Price", "Gap %", "Volume", "Market Cap ($M)", "Float (M)"]
             )
 
         df = pd.DataFrame(matches)
@@ -216,12 +222,12 @@ class MassiveMomentumScreener:
         disp["Gap %"] = df["Gap %"].apply(lambda g: f"{g:+.2f}%")
         disp["Volume"] = df["Volume"].apply(lambda v: f"{int(v):,}")
         disp["Market Cap ($M)"] = df["Market Cap ($M)"].apply(lambda mc: f"${mc:,.2f}")
-        disp["Est. Float (M)"] = df["Est. Float (M)"].apply(lambda fl: f"{fl:,.2f}")
+        disp["Float (M)"] = df["Float (M)"].apply(lambda fl: f"{fl:,.2f}" if pd.notna(fl) else "N/A")
         return disp
 
 
 def print_results(df: pd.DataFrame):
-    cols = ["Ticker", "Price", "Gap %", "Volume", "Market Cap ($M)", "Est. Float (M)"]
+    cols = ["Ticker", "Price", "Gap %", "Volume", "Market Cap ($M)", "Float (M)"]
     print("\n" + "=" * 80)
     print(" " * 18 + "MOMENTUM SCREENER (MASSIVE SDK)")
     print("=" * 80)

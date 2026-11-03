@@ -9,6 +9,8 @@ import sys
 import argparse
 import requests
 import pandas as pd
+import math
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 # Load .env file if available
@@ -36,7 +38,7 @@ DEMO_DATA = [
 
 
 class MiddayScreener:
-    def __init__(self, api_key=None, min_volume=500000, source="polygon", min_rvol=5.0):
+    def __init__(self, api_key=None, min_volume=500000, source="polygon", min_rvol=5.0, float_mode="strict"):
         self.api_key = (
             api_key
             or os.getenv("MASSIVE_API_KEY")
@@ -47,12 +49,29 @@ class MiddayScreener:
             min_rvol = source
             source = "polygon"
         self.source = source
+        self.float_mode = float_mode
         try:
             self.min_rvol = float(min_rvol)
         except (ValueError, TypeError):
             self.min_rvol = 5.0
         self.last_error = None
         self.last_status = "ok"
+        self._avg_volume_cache = {}
+
+    def _get(self, url, **kwargs):
+        """Bounded retry for transient rate-limit/server/network failures."""
+        for attempt in range(3):
+            try:
+                response = requests.get(url, **kwargs)
+                if response.status_code == 429 or 500 <= response.status_code < 600:
+                    if attempt < 2:
+                        time.sleep(0.25 * (2 ** attempt))
+                        continue
+                return response
+            except requests.exceptions.RequestException:
+                if attempt == 2:
+                    raise
+                time.sleep(0.25 * (2 ** attempt))
 
     def fetch_polygon_data(self):
         if not self.api_key:
@@ -64,7 +83,7 @@ class MiddayScreener:
         url = "https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers"
         headers = {"Authorization": f"Bearer {self.api_key}"}
         try:
-            response = requests.get(url, headers=headers, timeout=15)
+            response = self._get(url, headers=headers, timeout=15)
         except requests.exceptions.RequestException as e:
             safe_err = str(e).replace(self.api_key, "[REDACTED]") if self.api_key else str(e)
             self.last_status = "failed"
@@ -104,8 +123,10 @@ class MiddayScreener:
                 change_pct = t.get("todaysChangePerc", 0.0)
 
             avg_vol = None
+            avg_vol_attempted = False
             if (2.00 <= price <= 10.00) and (change_pct >= 10.0) and (volume >= self.min_volume):
                 avg_vol = self.fetch_polygon_historical_avg_volume(ticker, days=10)
+                avg_vol_attempted = True
 
             parsed.append({
                 "ticker": ticker,
@@ -113,6 +134,7 @@ class MiddayScreener:
                 "change_pct": round(change_pct, 2),
                 "volume": volume,
                 "avg_volume": avg_vol,
+                "avg_volume_attempted": avg_vol_attempted,
                 "market_cap": None,  # Enriched via reference call
                 "float": None,
             })
@@ -126,26 +148,38 @@ class MiddayScreener:
             return []
 
         print("[*] Fetching live small-cap active symbols via Yahoo Finance...")
-        # Curated active small-cap test basket for free engine illustration
-        watchlist = ["RONI", "APEX", "ZGNL", "VORT", "MULN", "SINT", "BBIG", "TRKA", "INUV", "CIDM", "CLRO", "FTFT", "CENN"]
         results = []
+        # Yahoo's screener provides dynamic discovery but has limited, opaque
+        # coverage and is not a guaranteed market-wide feed.
+        try:
+            query = yf.EquityQuery("and", [
+                yf.EquityQuery("gte", ["intradayprice", 2.0]),
+                yf.EquityQuery("lte", ["intradayprice", 10.0]),
+                yf.EquityQuery("gte", ["dayvolume", self.min_volume]),
+                yf.EquityQuery("gte", ["percentchange", 10.0]),
+            ])
+            quotes = yf.screen(query, size=250).get("quotes", [])
+        except Exception as exc:
+            self.last_status = "failed"
+            self.last_error = f"Yahoo Finance discovery failed ({type(exc).__name__})."
+            print(f"[!] {self.last_error}")
+            return []
 
-        for symbol in watchlist:
+        for quote in quotes:
+            symbol = quote.get("symbol")
+            if not symbol or "." in symbol:
+                continue
             try:
                 tk = yf.Ticker(symbol)
-                hist = tk.history(period="2d")
                 info = tk.info or {}
-
-                if len(hist) < 2:
-                    continue
-
-                prev_close = hist['Close'].iloc[-2]
-                curr_price = hist['Close'].iloc[-1]
-                volume = int(hist['Volume'].iloc[-1])
-                change_pct = ((curr_price - prev_close) / prev_close) * 100
+                curr_price = quote.get("regularMarketPrice")
+                change_pct = quote.get("regularMarketChangePercent")
+                volume = quote.get("regularMarketVolume")
                 market_cap = info.get("marketCap")
-                shares_out = info.get("floatShares")
-                avg_vol = info.get("averageVolume10days") or info.get("averageVolume") or 100000
+                float_shares = info.get("floatShares")
+                avg_vol = info.get("averageVolume10days") or info.get("averageVolume")
+                if not curr_price or change_pct is None or volume is None:
+                    continue
 
                 results.append({
                     "ticker": symbol,
@@ -154,7 +188,7 @@ class MiddayScreener:
                     "volume": volume,
                     "avg_volume": avg_vol,
                     "market_cap": market_cap,
-                    "float": shares_out,
+                    "float": float_shares,
                 })
             except Exception:
                 continue
@@ -163,21 +197,37 @@ class MiddayScreener:
     def fetch_polygon_historical_avg_volume(self, ticker: str, days: int = 10):
         if not self.api_key:
             return None
+        if hasattr(self, "_avg_volume_cache") and ticker in self._avg_volume_cache:
+            return self._avg_volume_cache[ticker]
+
         from datetime import datetime, timedelta
-        end_date = datetime.now().strftime("%Y-%m-%d")
-        start_date = (datetime.now() - timedelta(days=days * 3)).strftime("%Y-%m-%d")
+        try:
+            from zoneinfo import ZoneInfo
+            now_et = datetime.now(ZoneInfo("America/New_York"))
+        except Exception:
+            from datetime import timezone
+            now_et = datetime.now(timezone(timedelta(hours=-5)))
+
+        end_date = (now_et.date() - timedelta(days=1)).strftime("%Y-%m-%d")
+        start_date = (now_et.date() - timedelta(days=days * 3)).strftime("%Y-%m-%d")
         url = f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/{start_date}/{end_date}"
         headers = {"Authorization": f"Bearer {self.api_key}"}
-        params = {"adjusted": "true", "sort": "desc", "limit": days}
+        params = {"adjusted": "true", "sort": "desc", "limit": 10}
         try:
-            resp = requests.get(url, headers=headers, params=params, timeout=10)
+            resp = self._get(url, headers=headers, params=params, timeout=10)
             if resp.status_code == 200:
                 results = resp.json().get("results", [])
                 volumes = [bar.get("v") for bar in results if bar.get("v") is not None]
                 if volumes:
-                    return float(sum(volumes) / len(volumes))
+                    avg_vol = float(sum(volumes) / len(volumes))
+                    if hasattr(self, "_avg_volume_cache"):
+                        self._avg_volume_cache[ticker] = avg_vol
+                    return avg_vol
         except requests.exceptions.RequestException:
             pass
+
+        if hasattr(self, "_avg_volume_cache"):
+            self._avg_volume_cache[ticker] = None
         return None
 
     def fetch_polygon_ticker_details(self, ticker: str):
@@ -186,7 +236,7 @@ class MiddayScreener:
         url = f"https://api.polygon.io/v3/reference/tickers/{ticker}"
         headers = {"Authorization": f"Bearer {self.api_key}"}
         try:
-            resp = requests.get(url, headers=headers, timeout=10)
+            resp = self._get(url, headers=headers, timeout=10)
             if resp.status_code == 200:
                 return resp.json().get("results", {})
         except requests.exceptions.RequestException:
@@ -205,12 +255,7 @@ class MiddayScreener:
                 if market_cap is None:
                     market_cap = details.get("market_cap")
                 if float_shares is None:
-                    float_shares = (
-                        details.get("free_float")
-                        or details.get("float")
-                        or details.get("share_class_shares_outstanding")
-                        or details.get("weighted_shares_outstanding")
-                    )
+                    float_shares = details.get("free_float")
 
         # Normalize None or invalid values
         try:
@@ -219,7 +264,8 @@ class MiddayScreener:
             item["market_cap"] = None
 
         try:
-            item["float"] = float(float_shares) if float_shares is not None else None
+            numeric_float = float(float_shares) if float_shares is not None else None
+            item["float"] = numeric_float if numeric_float is not None and math.isfinite(numeric_float) and numeric_float > 0 else None
         except (ValueError, TypeError):
             item["float"] = None
 
@@ -228,6 +274,7 @@ class MiddayScreener:
     def run(self, demo=False, sort_by="volume", min_rvol=None):
         self.last_error = None
         self.last_status = "ok"
+        self._avg_volume_cache = {}
         try:
             rvol_threshold = float(self.min_rvol if min_rvol is None else min_rvol)
         except (ValueError, TypeError):
@@ -248,12 +295,24 @@ class MiddayScreener:
 
             # Ensure avg_volume is calculated from historical daily volumes before applying RVOL gate
             avg_baseline_volume = item.get("avg_volume")
-            if not demo and avg_baseline_volume is None and self.source == "polygon" and self.api_key:
+            ticker = item.get("ticker")
+            attempted = item.get("avg_volume_attempted", False) or (
+                hasattr(self, "_avg_volume_cache") and ticker in self._avg_volume_cache
+            )
+            if (
+                not demo
+                and avg_baseline_volume is None
+                and not attempted
+                and self.source == "polygon"
+                and self.api_key
+            ):
                 if (2.00 <= price <= 10.00) and (change_pct >= 10.0) and (current_volume >= self.min_volume):
-                    avg_baseline_volume = self.fetch_polygon_historical_avg_volume(item.get("ticker"), days=10)
+                    avg_baseline_volume = self.fetch_polygon_historical_avg_volume(ticker, days=10)
                     item["avg_volume"] = avg_baseline_volume
+                    item["avg_volume_attempted"] = True
 
-            avg_baseline_volume = avg_baseline_volume or 100000
+            if not isinstance(avg_baseline_volume, (int, float)) or not math.isfinite(avg_baseline_volume) or avg_baseline_volume <= 0:
+                continue
 
             # Calculate Relative Volume multiplier
             rvol = current_volume / avg_baseline_volume if avg_baseline_volume > 0 else 0
@@ -267,16 +326,18 @@ class MiddayScreener:
 
                 # Fundamental Rules: Float <= 10M, Market Cap <= $100M
                 # Candidates with unknown fundamentals are excluded
-                if mcap is not None and fl is not None:
-                    if fl <= 10000000 and mcap <= 100000000:
+                if isinstance(mcap, (int, float)) and math.isfinite(mcap) and mcap > 0 and (fl is not None or self.float_mode == "discovery"):
+                    if (fl is None or fl <= 10000000) and mcap <= 100000000:
                         filtered.append({
                             "Ticker": enriched["ticker"],
-                            "Price": f"${enriched['price']:.2f}",
-                            "Today's Change %": f"+{enriched['change_pct']:.2f}%" if enriched['change_pct'] >= 0 else f"{enriched['change_pct']:.2f}%",
-                            "Volume": f"{enriched['volume']:,}",
-                            "RVOL": f"{rvol:.1f}x",
+                            "Price": enriched["price"],
+                            "Today's Change %": enriched["change_pct"],
+                            "Volume": enriched["volume"],
+                            "RVOL": rvol,
                             "Market Cap ($M)": round(enriched['market_cap'] / 1_000_000, 2),
-                            "Est. Float (M)": round(enriched['float'] / 1_000_000, 2),
+                            "Float (M)": round(enriched['float'] / 1_000_000, 2) if enriched['float'] is not None else "N/A",
+                            "Float Status": "verified" if enriched['float'] is not None else "unverified",
+                            "RVOL Type": "daily",
                             "_raw_volume": enriched['volume'],
                             "_raw_change": enriched['change_pct'],
                             "_raw_rvol": rvol,
@@ -302,6 +363,7 @@ if __name__ == "__main__":
     parser.add_argument("--source", type=str, default="polygon", choices=["polygon", "yfinance"], help="Data engine source")
     parser.add_argument("--min-volume", type=int, default=500000, help="Minimum active intraday volume")
     parser.add_argument("--min-rvol", type=float, default=5.0, help="Minimum Relative Volume (RVOL) multiplier (default: 5.0x)")
+    parser.add_argument("--float-mode", choices=["strict", "discovery"], default="strict", help="Strictly require public float or include unknown float flagged")
     parser.add_argument("--sort-by", type=str, default="volume", choices=["volume", "change", "rvol"], help="Sort order: volume, change, or rvol")
     parser.add_argument(
         "-k",
@@ -318,6 +380,7 @@ if __name__ == "__main__":
         min_volume=args.min_volume,
         source=args.source,
         min_rvol=args.min_rvol,
+        float_mode=args.float_mode,
     )
     df_result = screener.run(demo=args.demo, sort_by=args.sort_by)
 
@@ -325,7 +388,12 @@ if __name__ == "__main__":
     if screener.last_error and not args.demo:
         print(f"[ERROR] Live scan failed: {screener.last_error}")
     elif not df_result.empty:
-        print(df_result.to_string(index=False))
+        display = df_result.copy()
+        display["Price"] = display["Price"].map(lambda v: f"${v:,.2f}")
+        display["Today's Change %"] = display["Today's Change %"].map(lambda v: f"{v:+.2f}%")
+        display["Volume"] = display["Volume"].map(lambda v: f"{int(v):,}")
+        display["RVOL"] = display["RVOL"].map(lambda v: f"{v:.1f}x")
+        print(display.to_string(index=False))
     else:
         print("No stocks currently match the exact midday momentum criteria.")
     print("")

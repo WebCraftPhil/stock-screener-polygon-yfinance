@@ -19,6 +19,7 @@ import sys
 import time
 import argparse
 import logging
+import math
 from typing import List, Dict, Any, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -59,6 +60,7 @@ class PolygonScreener:
         min_gap_pct: float = 5.0,
         timeout: int = 20,
         max_workers: int = 5,
+        float_mode: str = "strict",
     ):
         self.api_key = (
             api_key
@@ -73,6 +75,7 @@ class PolygonScreener:
         self.min_gap_pct = min_gap_pct
         self.timeout = timeout
         self.max_workers = max_workers
+        self.float_mode = float_mode
 
         self.session = self._create_resilient_session()
         if self.api_key:
@@ -253,30 +256,21 @@ class PolygonScreener:
             # Extract market cap
             market_cap = details.get("market_cap")
 
-            # Extract estimated float / shares outstanding
-            # Polygon provides share_class_shares_outstanding, weighted_shares_outstanding,
-            # or dedicated free float if available.
-            est_float = (
-                details.get("free_float")
-                or details.get("float")
-                or details.get("share_class_shares_outstanding")
-                or details.get("weighted_shares_outstanding")
-            )
-
-            # Fallback estimation if market_cap is present but float is missing
-            if est_float is None and market_cap and candidate["price"] > 0:
-                est_float = market_cap / candidate["price"]
-
-            # Fallback estimation if float is present but market_cap is missing
-            if market_cap is None and est_float and candidate["price"] > 0:
-                market_cap = est_float * candidate["price"]
+            float_shares = details.get("free_float")
+            shares_outstanding = details.get("share_class_shares_outstanding") or details.get("weighted_shares_outstanding")
+            if not isinstance(float_shares, (int, float)) or not math.isfinite(float_shares) or float_shares <= 0:
+                float_shares = None
+            if not isinstance(market_cap, (int, float)) or not math.isfinite(market_cap) or market_cap <= 0:
+                market_cap = None
 
             # Check market cap rule: <= $100M
             if market_cap is None or market_cap > self.max_market_cap:
                 return None
 
             # Check float rule: <= 10M shares
-            if est_float is None or est_float > self.max_float:
+            if float_shares is None and self.float_mode == "strict":
+                return None
+            if float_shares is not None and float_shares > self.max_float:
                 return None
 
             return {
@@ -285,9 +279,13 @@ class PolygonScreener:
                 "Gap %": candidate["gap_pct"],
                 "Volume": candidate["volume"],
                 "Market Cap": market_cap,
-                "Est. Float": est_float,
+                "Float": float_shares,
+                "Shares Outstanding": shares_outstanding,
+                "Float Status": "verified" if float_shares is not None else "unverified",
+                "Float Source": "Massive/Polygon free_float" if float_shares is not None else None,
+                "Float Timestamp": details.get("float_last_updated"),
                 "Market Cap ($M)": market_cap / 1_000_000.0,
-                "Est. Float (M)": est_float / 1_000_000.0,
+                "Float (M)": float_shares / 1_000_000.0 if float_shares is not None else None,
             }
 
         # Concurrently fetch reference details to minimize latency
@@ -324,7 +322,7 @@ class PolygonScreener:
             logger.info("No tickers matched all screening criteria.")
             # Return empty DataFrame with specified columns
             return pd.DataFrame(
-                columns=["Ticker", "Price", "Gap %", "Volume", "Market Cap ($M)", "Est. Float (M)"]
+                columns=["Ticker", "Price", "Gap %", "Volume", "Market Cap ($M)", "Float (M)"]
             )
 
         df = pd.DataFrame(matches)
@@ -342,7 +340,7 @@ class PolygonScreener:
           - Gap %: +X.XX%
           - Volume: 1,234,567
           - Market Cap ($M): $X.XX
-          - Est. Float (M): X.XX
+          - Float (M): X.XX
         """
         if df.empty:
             return df
@@ -353,7 +351,7 @@ class PolygonScreener:
         display_df["Gap %"] = df["Gap %"].apply(lambda g: f"{g:+.2f}%")
         display_df["Volume"] = df["Volume"].apply(lambda v: f"{int(v):,}")
         display_df["Market Cap ($M)"] = df["Market Cap ($M)"].apply(lambda mc: f"${mc:,.2f}")
-        display_df["Est. Float (M)"] = df["Est. Float (M)"].apply(lambda fl: f"{fl:,.2f}")
+        display_df["Float (M)"] = df["Float (M)"].apply(lambda fl: f"{fl:,.2f}" if pd.notna(fl) else "N/A")
         return display_df
 
 
@@ -416,22 +414,27 @@ def get_mock_ticker_details(ticker: str) -> Optional[Dict[str, Any]]:
     mock_db = {
         "MOMN": {
             "market_cap": 25_000_000,
+            "free_float": 5_500_000,
             "share_class_shares_outstanding": 7_200_000,
         },
         "RUNR": {
             "market_cap": 48_000_000,
+            "free_float": 8_000_000,
             "share_class_shares_outstanding": 9_100_000,
         },
         "ROCK": {
             "market_cap": 18_500_000,
+            "free_float": 1_900_000,
             "share_class_shares_outstanding": 2_300_000,
         },
         "BIGC": {
             "market_cap": 450_000_000,  # Fails market cap <= 100M
+            "free_float": 7_000_000,
             "share_class_shares_outstanding": 8_000_000,
         },
         "HIGHF": {
             "market_cap": 60_000_000,
+            "free_float": 35_000_000,
             "share_class_shares_outstanding": 35_000_000,  # Fails float <= 10M
         },
     }
@@ -459,7 +462,7 @@ def run_demo(screener: Optional[PolygonScreener] = None):
         df = df.sort_values(by="Volume", ascending=False).reset_index(drop=True)
     else:
         df = pd.DataFrame(
-            columns=["Ticker", "Price", "Gap %", "Volume", "Market Cap ($M)", "Est. Float (M)"]
+            columns=["Ticker", "Price", "Gap %", "Volume", "Market Cap ($M)", "Float (M)"]
         )
 
     print_screener_results(df, screener=screener)
@@ -483,7 +486,7 @@ def _format_rule_number(val: float) -> str:
 
 def print_screener_results(df: pd.DataFrame, screener: Optional[PolygonScreener] = None):
     """Print the formatted DataFrame to the terminal with header decorations."""
-    columns_to_show = ["Ticker", "Price", "Gap %", "Volume", "Market Cap ($M)", "Est. Float (M)"]
+    columns_to_show = ["Ticker", "Price", "Gap %", "Volume", "Market Cap ($M)", "Float (M)"]
 
     print("\n" + "=" * 80)
     print(" " * 20 + "SMALL-CAP MOMENTUM SCREENER RESULTS")
@@ -573,6 +576,7 @@ def main():
         default=5,
         help="Max concurrent worker threads for ticker reference lookups (default: 5)",
     )
+    parser.add_argument("--float-mode", choices=["strict", "discovery"], default="strict", help="How to handle missing verified public float")
     parser.add_argument(
         "--demo",
         action="store_true",
@@ -590,6 +594,7 @@ def main():
         max_market_cap=args.max_market_cap,
         min_gap_pct=args.min_gap,
         max_workers=args.workers,
+        float_mode=args.float_mode,
     )
 
     if args.demo:
