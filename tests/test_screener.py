@@ -415,6 +415,88 @@ def test_format_rule_number_preserves_exact_values():
     assert _format_rule_number(10_000_001) == "10.000001M"
     # When compact representation cannot round-trip exactly, full value is shown
     assert _format_rule_number(10_000_000_000_001) == "10000000000001"
+    # Fallback for non-compact float round-trips the exact float value
+    assert _format_rule_number(10_000_000_000_001.25) == "10000000000001.25"
+
+
+def test_midday_init_parameter_order_and_rvol():
+    """Verify MiddayScreener 3rd positional argument selects source and min_rvol is configurable."""
+    from midday_screener import MiddayScreener
+
+    # 3rd positional arg selects source
+    s1 = MiddayScreener("TEST_KEY", 500000, "yfinance")
+    assert s1.api_key == "TEST_KEY"
+    assert s1.min_volume == 500000
+    assert s1.source == "yfinance"
+    assert s1.min_rvol == 5.0
+
+    # min_rvol configurable without shifting source
+    s2 = MiddayScreener("TEST_KEY", 500000, "yfinance", min_rvol=3.0)
+    assert s2.source == "yfinance"
+    assert s2.min_rvol == 3.0
+
+    s3 = MiddayScreener("TEST_KEY", 500000, "polygon", 2.5)
+    assert s3.source == "polygon"
+    assert s3.min_rvol == 2.5
+
+    # run() accepts numeric RVOL override
+    df = s1.run(demo=True, min_rvol=10.0)
+    # Only VORT (rvol 12.4x) matches when min_rvol=10.0
+    assert len(df) == 1
+    assert df.iloc[0]["Ticker"] == "VORT"
+
+
+def test_midday_both_volume_and_rvol_limits_enforced():
+    """Verify both min_volume and min_rvol thresholds are enforced simultaneously."""
+    from midday_screener import MiddayScreener
+
+    items = [
+        # Pass: volume 600K >= 500K and rvol 6.0 >= 5.0
+        {"ticker": "PASS", "price": 5.0, "change_pct": 15.0, "volume": 600_000, "avg_volume": 100_000, "market_cap": 25_000_000, "float": 5_000_000},
+        # Fail: rvol is 10.0 >= 5.0, but volume 400K < 500K
+        {"ticker": "LOW_VOL", "price": 5.0, "change_pct": 15.0, "volume": 400_000, "avg_volume": 40_000, "market_cap": 25_000_000, "float": 5_000_000},
+        # Fail: volume 1M >= 500K, but rvol is 2.0 < 5.0
+        {"ticker": "LOW_RVOL", "price": 5.0, "change_pct": 15.0, "volume": 1_000_000, "avg_volume": 500_000, "market_cap": 25_000_000, "float": 5_000_000},
+        # Fail: price out of range ($1.50)
+        {"ticker": "LOW_PRICE", "price": 1.5, "change_pct": 15.0, "volume": 600_000, "avg_volume": 100_000, "market_cap": 25_000_000, "float": 5_000_000},
+        # Fail: change_pct too low (5.0%)
+        {"ticker": "LOW_CHANGE", "price": 5.0, "change_pct": 5.0, "volume": 600_000, "avg_volume": 100_000, "market_cap": 25_000_000, "float": 5_000_000},
+    ]
+
+    screener = MiddayScreener(api_key="TEST_KEY", min_volume=500_000, min_rvol=5.0)
+    screener.fetch_polygon_data = lambda: items
+    df = screener.run(demo=False)
+
+    assert len(df) == 1
+    assert df.iloc[0]["Ticker"] == "PASS"
+
+
+def test_fetch_polygon_historical_avg_volume_and_rvol_gate():
+    """Verify Polygon path fetches 10-day historical daily volume average before RVOL gate."""
+    from midday_screener import MiddayScreener
+
+    screener = MiddayScreener(api_key="TEST_KEY", source="polygon", min_volume=500_000, min_rvol=5.0)
+
+    # Mock historical daily aggregates response (10 bars)
+    mock_aggs = {
+        "results": [{"v": 100_000}, {"v": 200_000}, {"v": 300_000}]
+    }
+
+    with patch("requests.get") as mock_get:
+        mock_resp = Mock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = mock_aggs
+        mock_get.return_value = mock_resp
+
+        avg_vol = screener.fetch_polygon_historical_avg_volume("TEST", days=10)
+        assert avg_vol == 200_000.0
+        mock_get.assert_called_once()
+        url = mock_get.call_args[0][0]
+        assert "/v2/aggs/ticker/TEST/range/1/day/" in url
+        params = mock_get.call_args[1].get("params", {})
+        assert params.get("limit") == 10
+        assert params.get("sort") == "desc"
+
 
 
 

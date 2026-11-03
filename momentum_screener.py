@@ -477,8 +477,8 @@ def _format_rule_number(val: float) -> str:
                     return f"{formatted_num}{suffix}"
             except (ValueError, OverflowError):
                 pass
-            return f"{int(val)}" if float(val).is_integer() else f"{val:.10g}"
-    return f"{int(val)}" if float(val).is_integer() else f"{val:.10g}"
+            return f"{int(val)}" if float(val).is_integer() else str(val)
+    return f"{int(val)}" if float(val).is_integer() else str(val)
 
 
 def print_screener_results(df: pd.DataFrame, screener: Optional[PolygonScreener] = None):

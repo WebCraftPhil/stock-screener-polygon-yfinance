@@ -36,15 +36,21 @@ DEMO_DATA = [
 
 
 class MiddayScreener:
-    def __init__(self, api_key=None, min_volume=500000, min_rvol=5.0, source="polygon"):
+    def __init__(self, api_key=None, min_volume=500000, source="polygon", min_rvol=5.0):
         self.api_key = (
             api_key
             or os.getenv("MASSIVE_API_KEY")
             or os.getenv("POLYGON_API_KEY")
         )
         self.min_volume = min_volume
-        self.min_rvol = min_rvol
+        if isinstance(source, (int, float)) and min_rvol == 5.0:
+            min_rvol = source
+            source = "polygon"
         self.source = source
+        try:
+            self.min_rvol = float(min_rvol)
+        except (ValueError, TypeError):
+            self.min_rvol = 5.0
         self.last_error = None
         self.last_status = "ok"
 
@@ -97,12 +103,16 @@ class MiddayScreener:
             else:
                 change_pct = t.get("todaysChangePerc", 0.0)
 
+            avg_vol = None
+            if (2.00 <= price <= 10.00) and (change_pct >= 10.0) and (volume >= self.min_volume):
+                avg_vol = self.fetch_polygon_historical_avg_volume(ticker, days=10)
+
             parsed.append({
                 "ticker": ticker,
                 "price": price,
                 "change_pct": round(change_pct, 2),
                 "volume": volume,
-                "avg_volume": prev_day.get("v") or 100000,
+                "avg_volume": avg_vol,
                 "market_cap": None,  # Enriched via reference call
                 "float": None,
             })
@@ -150,6 +160,26 @@ class MiddayScreener:
                 continue
         return results
 
+    def fetch_polygon_historical_avg_volume(self, ticker: str, days: int = 10):
+        if not self.api_key:
+            return None
+        from datetime import datetime, timedelta
+        end_date = datetime.now().strftime("%Y-%m-%d")
+        start_date = (datetime.now() - timedelta(days=days * 3)).strftime("%Y-%m-%d")
+        url = f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/{start_date}/{end_date}"
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+        params = {"adjusted": "true", "sort": "desc", "limit": days}
+        try:
+            resp = requests.get(url, headers=headers, params=params, timeout=10)
+            if resp.status_code == 200:
+                results = resp.json().get("results", [])
+                volumes = [bar.get("v") for bar in results if bar.get("v") is not None]
+                if volumes:
+                    return float(sum(volumes) / len(volumes))
+        except requests.exceptions.RequestException:
+            pass
+        return None
+
     def fetch_polygon_ticker_details(self, ticker: str):
         if not self.api_key:
             return None
@@ -195,9 +225,13 @@ class MiddayScreener:
 
         return item
 
-    def run(self, demo=False, sort_by="volume"):
+    def run(self, demo=False, sort_by="volume", min_rvol=None):
         self.last_error = None
         self.last_status = "ok"
+        try:
+            rvol_threshold = float(self.min_rvol if min_rvol is None else min_rvol)
+        except (ValueError, TypeError):
+            rvol_threshold = 5.0
 
         if demo:
             raw_data = DEMO_DATA
@@ -211,13 +245,21 @@ class MiddayScreener:
             price = item.get("price") or 0
             change_pct = item.get("change_pct") or 0
             current_volume = item.get("volume") or 0
-            avg_baseline_volume = item.get("avg_volume") or 100000  # 10-day baseline historical average
+
+            # Ensure avg_volume is calculated from historical daily volumes before applying RVOL gate
+            avg_baseline_volume = item.get("avg_volume")
+            if not demo and avg_baseline_volume is None and self.source == "polygon" and self.api_key:
+                if (2.00 <= price <= 10.00) and (change_pct >= 10.0) and (current_volume >= self.min_volume):
+                    avg_baseline_volume = self.fetch_polygon_historical_avg_volume(item.get("ticker"), days=10)
+                    item["avg_volume"] = avg_baseline_volume
+
+            avg_baseline_volume = avg_baseline_volume or 100000
 
             # Calculate Relative Volume multiplier
             rvol = current_volume / avg_baseline_volume if avg_baseline_volume > 0 else 0
 
             # Apply exact rules including price, change, volume, and 5x RVOL
-            if (2.00 <= price <= 10.00) and (change_pct >= 10.0) and (current_volume >= self.min_volume) and (rvol >= self.min_rvol):
+            if (2.00 <= price <= 10.00) and (change_pct >= 10.0) and (current_volume >= self.min_volume) and (rvol >= rvol_threshold):
                 enriched = self.enrich_ticker(item)
 
                 mcap = enriched.get("market_cap")
@@ -274,8 +316,8 @@ if __name__ == "__main__":
     screener = MiddayScreener(
         api_key=args.api_key,
         min_volume=args.min_volume,
-        min_rvol=args.min_rvol,
         source=args.source,
+        min_rvol=args.min_rvol,
     )
     df_result = screener.run(demo=args.demo, sort_by=args.sort_by)
 
