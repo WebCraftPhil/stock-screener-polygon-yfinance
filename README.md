@@ -50,6 +50,14 @@ python screener.py --min-price 3 --max-price 8 --min-volume 500000 --max-float 1
 python midday_screener.py --demo --min-rvol 5 --sort-by volume
 ```
 
+### Finnhub Engine (Live Quotes & Fundamentals)
+If you have `FINNHUB_API_KEY` set in `.env`:
+```bash
+python midday_screener.py --source finnhub
+# Or run the standalone Finnhub screener:
+python finnhub_screener.py
+```
+
 Results sort by volume by default. DataFrames retain numeric values; terminal output formats values for readability. Output labels public float as `Float`, never estimated float.
 
 ## Tests

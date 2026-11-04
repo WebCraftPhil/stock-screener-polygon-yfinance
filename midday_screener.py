@@ -45,6 +45,8 @@ class MiddayScreener:
         if isinstance(source, (int, float)) and min_rvol == 5.0:
             min_rvol = source
             source = "polygon"
+        if source == "polygon" and os.getenv("FINNHUB_API_KEY") and not (os.getenv("MASSIVE_API_KEY") or os.getenv("POLYGON_API_KEY")):
+            source = "finnhub"
         self.source = source
         self.float_mode = float_mode
         if self.source == "finnhub":
@@ -96,7 +98,12 @@ class MiddayScreener:
 
         if response.status_code == 403:
             print("[!] Polygon API returned 403 Forbidden (Starter/Developer tier required for snapshots).")
-            if YFINANCE_AVAILABLE:
+            if os.getenv("FINNHUB_API_KEY"):
+                print("[*] Automatically falling back to Finnhub live engine (--source finnhub)...")
+                self.api_key = os.getenv("FINNHUB_API_KEY")
+                self.source = "finnhub"
+                return self.fetch_finnhub_data()
+            elif YFINANCE_AVAILABLE:
                 print("[*] Automatically falling back to Yahoo Finance live engine (--source yfinance)...")
                 return self.fetch_yfinance_data()
             else:
@@ -216,6 +223,8 @@ class MiddayScreener:
             )
         except requests.exceptions.RequestException as exc:
             raise RuntimeError(f"Finnhub request failed ({type(exc).__name__}).") from None
+        if response.status_code in (401, 403):
+            raise PermissionError(f"Finnhub authentication or entitlement failed (HTTP {response.status_code}).")
         if response.status_code != 200:
             raise RuntimeError(f"Finnhub returned HTTP {response.status_code} for {path}.")
         try:
@@ -277,11 +286,21 @@ class MiddayScreener:
                     "market_cap_source": "Finnhub profile2",
                 })
                 rows.append(item)
+            except PermissionError as exc:
+                self.last_status = "failed"
+                self.last_error = str(exc)
+                return rows
             except (RuntimeError, ValueError, TypeError, OverflowError):
                 failures += 1
         if failures and not rows:
             self.last_status = "failed"
-            self.last_error = "Finnhub quote/profile requests failed for all discovered candidates."
+            if stale_quotes:
+                self.last_error = (
+                    f"Finnhub quote/profile requests failed for {failures} candidate(s) "
+                    f"and quotes were stale for {stale_quotes} candidate(s)."
+                )
+            else:
+                self.last_error = "Finnhub quote/profile requests failed for all discovered candidates."
         elif failures:
             self.last_status = "incomplete"
             self.last_error = f"Finnhub data incomplete for {failures} candidate(s)."

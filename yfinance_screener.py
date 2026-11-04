@@ -136,7 +136,8 @@ class YFinanceScreener:
                 return None
             quote_epoch = q.get("regularMarketTime")
             quote_dt = datetime.fromtimestamp(quote_epoch, timezone.utc) if quote_epoch else None
-            if quote_dt and (datetime.now(timezone.utc) - quote_dt).total_seconds() > 15 * 60:
+            # Discard stale quotes from prior days / sessions older than 24 hours
+            if quote_dt and (datetime.now(timezone.utc) - quote_dt).total_seconds() > 24 * 3600:
                 logger.warning("Skipping stale Yahoo quote for %s (timestamp %s).", symbol, quote_dt.isoformat())
                 return None
 

@@ -5,6 +5,7 @@ Unit tests for Small-Cap Momentum Screener (Polygon.io).
 import pytest
 import pandas as pd
 from unittest.mock import Mock, patch
+import requests
 from requests.exceptions import Timeout, ConnectionError
 
 from momentum_screener import (
@@ -576,10 +577,110 @@ def test_midday_finnhub_quote_and_profile_are_bounded_and_attributed():
 def test_finnhub_request_errors_do_not_expose_token():
     from midday_screener import MiddayScreener
     scanner = MiddayScreener(api_key="TOP_SECRET", source="finnhub")
-    with patch("midday_screener.requests.get", side_effect=ConnectionError("url contained TOP_SECRET")):
+    with patch("midday_screener.requests.get", side_effect=requests.exceptions.ConnectionError("url contained TOP_SECRET")):
         with pytest.raises(RuntimeError) as exc:
             scanner._finnhub_json("quote", {"symbol": "ABC"})
     assert "TOP_SECRET" not in str(exc.value)
+
+
+def test_finnhub_distinguishes_401_403_and_preserves_other_non_200():
+    from midday_screener import MiddayScreener
+    scanner = MiddayScreener(api_key="TEST_KEY", source="finnhub")
+
+    for status_code in (401, 403):
+        mock_resp = Mock(status_code=status_code)
+        with patch.object(scanner, "_get", return_value=mock_resp), patch("midday_screener.time.sleep"):
+            with pytest.raises(PermissionError) as exc:
+                scanner._finnhub_json("quote", {"symbol": "ABC"})
+            assert f"HTTP {status_code}" in str(exc.value)
+            assert "authentication or entitlement" in str(exc.value)
+
+    mock_resp_500 = Mock(status_code=500)
+    with patch.object(scanner, "_get", return_value=mock_resp_500), patch("midday_screener.time.sleep"):
+        with pytest.raises(RuntimeError) as exc:
+            scanner._finnhub_json("quote", {"symbol": "ABC"})
+        assert "HTTP 500" in str(exc.value)
+
+
+def test_fetch_finnhub_data_stops_on_auth_failure_and_returns_collected_rows():
+    from datetime import datetime, timezone
+    from midday_screener import MiddayScreener
+
+    scanner = MiddayScreener(api_key="TEST_KEY", source="finnhub")
+    scanner.fetch_yfinance_data = lambda limit=250: [
+        {"ticker": "FIRST", "price": 5.0, "change_pct": 12.0, "volume": 1_000_000, "avg_volume": 100_000, "market_cap": None, "float": None},
+        {"ticker": "SECOND", "price": 6.0, "change_pct": 15.0, "volume": 2_000_000, "avg_volume": 200_000, "market_cap": None, "float": None},
+        {"ticker": "THIRD", "price": 7.0, "change_pct": 20.0, "volume": 3_000_000, "avg_volume": 300_000, "market_cap": None, "float": None},
+    ]
+
+    now = int(datetime.now(timezone.utc).timestamp())
+    calls = []
+
+    def mock_finnhub_json(path, params):
+        calls.append((path, params.get("symbol")))
+        sym = params.get("symbol")
+        if sym == "FIRST":
+            if path == "quote":
+                return {"c": 5.0, "dp": 12.0, "t": now}
+            return {"marketCapitalization": 20, "shareOutstanding": 5}
+        elif sym == "SECOND":
+            raise PermissionError("Finnhub authentication or entitlement failed (HTTP 401).")
+        raise RuntimeError("Should not be called for THIRD")
+
+    with patch.object(scanner, "_finnhub_json", side_effect=mock_finnhub_json):
+        rows = scanner.fetch_finnhub_data()
+
+    # Returned first row already collected
+    assert len(rows) == 1
+    assert rows[0]["ticker"] == "FIRST"
+    # THIRD candidate was never processed
+    assert not any(sym == "THIRD" for _, sym in calls)
+    # Failed status and authentication message recorded
+    assert scanner.last_status == "failed"
+    assert "authentication or entitlement" in scanner.last_error
+    assert "HTTP 401" in scanner.last_error
+
+
+def test_fetch_finnhub_data_failures_and_stale_quotes_accounting():
+    from datetime import datetime, timezone, timedelta
+    from midday_screener import MiddayScreener
+
+    scanner = MiddayScreener(api_key="TEST_KEY", source="finnhub")
+    scanner.fetch_yfinance_data = lambda limit=250: [
+        {"ticker": "FAIL1"},
+        {"ticker": "STALE1"},
+        {"ticker": "FAIL2"},
+    ]
+
+    stale_ts = int((datetime.now(timezone.utc) - timedelta(minutes=30)).timestamp())
+
+    def mock_finnhub_json(path, params):
+        sym = params.get("symbol")
+        if sym == "STALE1":
+            if path == "quote":
+                return {"c": 5.0, "dp": 10.0, "t": stale_ts}
+            return {"marketCapitalization": 10, "shareOutstanding": 2}
+        raise RuntimeError(f"Request failed for {sym}")
+
+    with patch.object(scanner, "_finnhub_json", side_effect=mock_finnhub_json):
+        rows = scanner.fetch_finnhub_data()
+
+    assert rows == []
+    assert scanner.last_status == "failed"
+    # Both failures (2) and stale_quotes (1) should be accounted for in the message
+    assert "2 candidate(s)" in scanner.last_error
+    assert "1 candidate(s)" in scanner.last_error
+    assert "stale" in scanner.last_error
+
+    # When failures only (no stale quotes), preserves original message
+    scanner2 = MiddayScreener(api_key="TEST_KEY", source="finnhub")
+    scanner2.fetch_yfinance_data = lambda limit=250: [{"ticker": "FAIL1"}]
+    with patch.object(scanner2, "_finnhub_json", side_effect=RuntimeError("Request failed")):
+        rows2 = scanner2.fetch_finnhub_data()
+
+    assert rows2 == []
+    assert scanner2.last_status == "failed"
+    assert scanner2.last_error == "Finnhub quote/profile requests failed for all discovered candidates."
 
 
 def test_fetch_polygon_historical_avg_volume_and_rvol_gate():
