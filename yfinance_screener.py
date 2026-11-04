@@ -21,6 +21,7 @@ import argparse
 import math
 from datetime import datetime, timezone
 from market_data import market_session
+from scan_io import load_watchlist, missing_symbols, scan_metadata, write_scan
 from typing import List, Dict, Any, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -58,13 +59,26 @@ class YFinanceScreener:
         self.min_gap_pct = min_gap_pct
         self.max_workers = max_workers
         self.float_mode = float_mode
+        self.last_status = "ok"
+        self.last_error = None
 
-    def fetch_candidates(self) -> List[Dict[str, Any]]:
+    def fetch_candidates(self, symbols: Optional[List[str]] = None) -> List[Dict[str, Any]]:
         """
         Query Yahoo Finance equity screener with server-side filters on
         price, volume, market cap, and change percent.
         """
         logger.info("Querying Yahoo Finance screener for momentum candidates...")
+
+        if symbols is not None:
+            quotes = []
+            for symbol in symbols:
+                try:
+                    info = yf.Ticker(symbol).info or {}
+                    if info.get("regularMarketPrice") is not None:
+                        quotes.append({"symbol": symbol, **info})
+                except Exception as exc:
+                    logger.warning("Yahoo returned no usable quote for %s (%s).", symbol, type(exc).__name__)
+            return quotes
 
         # Construct Yahoo Finance EquityQuery
         query = yf.EquityQuery("and", [
@@ -81,6 +95,8 @@ class YFinanceScreener:
             logger.info(f"Retrieved {len(quotes)} candidate quote(s) from Yahoo Finance.")
             return quotes
         except Exception as e:
+            self.last_status = "failed"
+            self.last_error = f"Yahoo Finance discovery failed ({type(e).__name__})."
             logger.error(f"Error querying Yahoo Finance screener: {e}")
             return []
 
@@ -100,12 +116,15 @@ class YFinanceScreener:
                 "float_timestamp": None,
             }
         except Exception as e:
+            self.last_status = "incomplete"
             logger.debug(f"Could not fetch info for {symbol}: {e}")
             return {"float_shares": None, "market_cap": None}
 
-    def scan(self) -> pd.DataFrame:
+    def scan(self, watchlist: Optional[List[str]] = None) -> pd.DataFrame:
         """Execute the screening pipeline and return the filtered DataFrame."""
-        quotes = self.fetch_candidates()
+        self.last_status = "ok"
+        self.last_error = None
+        quotes = self.fetch_candidates(watchlist)
         if not quotes:
             logger.info("No stocks matched the initial screener query.")
             return pd.DataFrame(
@@ -289,6 +308,9 @@ def main():
         help="Max worker threads (default: 6)",
     )
     parser.add_argument("--float-mode", choices=["strict", "discovery"], default="strict", help="Exclude unknown public float (strict) or include and flag it (discovery)")
+    parser.add_argument("--watchlist", help="Ticker list file (one symbol per line or comma-separated)")
+    parser.add_argument("--export", help="Write scan results and metadata to CSV")
+    parser.add_argument("--history", help="Append scan results and metadata to a CSV history file")
 
     args = parser.parse_args()
 
@@ -302,8 +324,26 @@ def main():
         max_workers=args.workers,
         float_mode=args.float_mode,
     )
-    df = screener.scan()
+    watchlist, invalid = load_watchlist(args.watchlist) if args.watchlist else (None, [])
+    if invalid:
+        print("[WARNING] Ignoring invalid watchlist entries: " + ", ".join(invalid))
+    if args.watchlist and not watchlist:
+        parser.error("watchlist contains no valid ticker symbols")
+    df = screener.scan(watchlist)
     print_screener_results(df)
+    if screener.last_status != "ok":
+        print(f"[SCAN STATUS: {screener.last_status}] {screener.last_error or 'Some provider data was unavailable.'}")
+    if watchlist:
+        missing = missing_symbols(watchlist, df.get("Ticker", []))
+        if missing:
+            print("[WARNING] No qualifying provider result for: " + ", ".join(missing))
+    metadata = scan_metadata("yfinance", {"min_price": args.min_price, "max_price": args.max_price, "min_volume": args.min_volume, "max_float": args.max_float, "max_market_cap": args.max_market_cap, "min_gap": args.min_gap, "float_mode": args.float_mode, "watchlist": args.watchlist or "provider discovery"}, status=screener.last_status, message=screener.last_error)
+    if args.export:
+        write_scan(df, args.export, metadata)
+        print(f"CSV export saved: {args.export}")
+    if args.history:
+        write_scan(df, args.history, metadata, append=True)
+        print(f"Scan appended to history: {args.history}")
 
 
 if __name__ == "__main__":

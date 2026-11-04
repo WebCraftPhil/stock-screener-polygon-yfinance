@@ -10,6 +10,8 @@ python screener.py
 python midday_screener.py --source yfinance
 python midday_screener.py --source yfinance --float-mode discovery --sort-by rvol
 python midday_screener.py --source finnhub --float-mode discovery
+python midday_screener.py --source yfinance --watchlist watchlist.txt --export scan.csv
+python midday_screener.py --source polygon --history scan-history.csv
 ```
 
 For API-backed sources, create `.env` from the template if you do not already have one, then add the key for the provider you plan to use:
@@ -33,13 +35,32 @@ python midday_screener.py --source polygon
 
 Configure `MASSIVE_API_KEY` or `POLYGON_API_KEY` in the environment or `.env`. Market snapshots and fundamentals may be plan-limited. Providers do not consistently expose public float or a separate extended-hours tape. Unknown values remain unknown; float is never derived from shares outstanding or market cap. Use `--float-mode strict|discovery`: strict excludes unknown float; discovery retains unknown float flagged `unverified`. Public float means shares available for public trading. Shares outstanding includes restricted and insider holdings. Market capitalization is equity value. These fields are distinct.
 
-The optional Finnhub midday source reads `FINNHUB_API_KEY` from `.env`. It uses Yahoo Finance's dynamically discovered results as a capped candidate list (up to 20 symbols), then requests Finnhub quote and company-profile data. This is not a full-market Finnhub scan. Finnhub profile data includes market capitalization and shares outstanding; public float is only populated if Yahoo provides its explicit `floatShares` field, otherwise strict mode excludes it or discovery mode flags it unknown. Quote and volume sources are shown separately because Finnhub's quote endpoint does not supply session volume in the quote response. Delayed status can be unknown. Finnhub calls are paced and transient failures are bounded; API access still depends on your account entitlement.
+The optional Finnhub midday source reads `FINNHUB_API_KEY` from `.env`. Without a watchlist, it uses Yahoo Finance's dynamically discovered results as a capped candidate list (up to 20 symbols), then requests Finnhub quote and company-profile data. With `--watchlist`, it performs per-symbol lookup. This is not a full-market Finnhub scan. Finnhub profile data includes market capitalization and shares outstanding; public float is only populated if Yahoo provides its explicit `floatShares` field, otherwise strict mode excludes it or discovery mode flags it unknown. Quote and volume sources are shown separately because Finnhub's quote endpoint does not supply session volume in the quote response. Delayed status can be unknown. Finnhub calls are paced and transient failures are bounded; API access still depends on your account entitlement.
+
+## Watchlists and saved scans
+
+Create a UTF-8 text or CSV file with one ticker per line or comma-separated symbols. Blank lines and lines beginning with `#` are ignored. Symbols are uppercased and deduplicated; invalid entries are reported and skipped.
+
+```text
+AAPL
+MSFT, NVDA
+# notes are allowed
+```
+
+The selected provider screens only the supplied symbols when `--watchlist` is used. Massive/Polygon uses its market snapshot and filters it to the list; Yahoo and Finnhub use direct per-symbol lookup where available. A warning lists symbols for which no qualifying result was returned. Provider candidate coverage and entitlement still apply.
+
+Use `--export PATH` to write one scan to CSV. Use `--history PATH` to append runs to a CSV history file. Both are opt-in. Each row includes a UTC run timestamp, provider, active filter summary, result values, and available source/freshness fields. Existing history is read and rewritten with new rows appended; choose a path that is writable and keep backups for important records. Empty scans still produce the metadata columns.
+
+```bash
+python screener.py --watchlist watchlist.txt --export scans/today.csv
+python midday_screener.py --source finnhub --watchlist watchlist.txt --history scans/history.csv
+```
 
 ## Sessions and relative volume
 
 Premarket gap is the latest valid premarket trade versus the prior regular close. Regular-session gain is current regular-session price versus prior regular close. They are different measures. Current Yahoo paths report regular-session gain only. Aggregate daily snapshot volume must not be presented as premarket volume without extended-hours trade data. `market_data.py` provides ET clock labels and an NYSE calendar helper; this does not create premarket prices or volume, and a session label does not verify market-wide holiday coverage.
 
-Midday RVOL is labelled **daily**: current cumulative session volume divided by the mean of available historical full-day volumes. It is not time-of-day-adjusted RVOL. Missing or invalid history excludes a candidate. No fixed baseline is substituted. Intraday historical baselines are not currently implemented.
+Midday RVOL is labelled **daily**: current cumulative session volume divided by the mean of available historical full-day volumes. It is not time-of-day-adjusted RVOL. Missing or invalid history excludes a candidate and marks the scan incomplete when it affected a candidate. No fixed baseline is substituted. Intraday historical baselines are not currently implemented. The standalone Finnhub screener uses observed daily candle volume and explicit profile float only; it does not infer session volume or public float from other fields.
 
 Missing market cap excludes a candidate. Missing, zero, negative, non-finite, or unavailable float is unknown. Float source and timestamp are retained if supplied. `N/A` and `unverified` indicate incomplete fundamentals. Free Yahoo may rate-limit, delay, omit fundamentals, and change result coverage. An empty scan and a provider failure are different states; check terminal error/status messages.
 

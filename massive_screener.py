@@ -21,6 +21,7 @@ import logging
 import math
 from typing import List, Dict, Any, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from scan_io import load_watchlist, missing_symbols, scan_metadata, write_scan
 
 import pandas as pd
 from dotenv import load_dotenv
@@ -197,9 +198,12 @@ class MassiveMomentumScreener:
 
         return results
 
-    def scan(self) -> pd.DataFrame:
+    def scan(self, watchlist=None) -> pd.DataFrame:
         """Run the full screening workflow."""
         snapshots = self.fetch_all_snapshots()
+        if watchlist:
+            allowed = set(watchlist)
+            snapshots = [item for item in snapshots if getattr(item, "ticker", None) in allowed]
         candidates = self.filter_snapshot_candidates(snapshots)
         matches = self.enrich_fundamentals(candidates)
 
@@ -252,12 +256,31 @@ def print_results(df: pd.DataFrame):
 def main():
     parser = argparse.ArgumentParser(description="Massive SDK Momentum Screener")
     parser.add_argument("-k", "--api-key", default=os.getenv("MASSIVE_API_KEY") or os.getenv("POLYGON_API_KEY"))
+    parser.add_argument("--watchlist", help="Ticker list file (one symbol per line or comma-separated)")
+    parser.add_argument("--export", help="Write scan results and metadata to CSV")
+    parser.add_argument("--history", help="Append scan results and metadata to a CSV history file")
     args = parser.parse_args()
 
     try:
+        watchlist, invalid = load_watchlist(args.watchlist) if args.watchlist else (None, [])
+        if invalid:
+            print("[WARNING] Ignoring invalid watchlist entries: " + ", ".join(invalid))
+        if args.watchlist and not watchlist:
+            parser.error("watchlist contains no valid ticker symbols")
         screener = MassiveMomentumScreener(api_key=args.api_key)
-        df = screener.scan()
+        df = screener.scan(watchlist)
         print_results(df)
+        if watchlist:
+            missing = missing_symbols(watchlist, df.get("Ticker", []))
+            if missing:
+                print("[WARNING] No qualifying provider result for: " + ", ".join(missing))
+        metadata = scan_metadata("massive", {"min_price": screener.min_price, "max_price": screener.max_price, "min_volume": screener.min_volume, "max_float": screener.max_float, "max_market_cap": screener.max_market_cap, "min_gap": screener.min_gap_pct, "float_mode": screener.float_mode, "watchlist": args.watchlist or "market snapshot"})
+        if args.export:
+            write_scan(df, args.export, metadata)
+            print(f"CSV export saved: {args.export}")
+        if args.history:
+            write_scan(df, args.history, metadata, append=True)
+            print(f"Scan appended to history: {args.history}")
     except Exception as e:
         sys.exit(1)
 

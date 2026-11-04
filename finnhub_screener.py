@@ -18,11 +18,14 @@ import os
 import sys
 import argparse
 import logging
+import math
+from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
 from dotenv import load_dotenv
+from scan_io import load_watchlist, missing_symbols, scan_metadata, write_scan
 
 load_dotenv()
 
@@ -69,6 +72,7 @@ class FinnhubScreener:
         min_rvol: float = 1.0,
         min_volume: int = 500_000,
         max_workers: int = 5,
+        float_mode: str = "strict",
     ):
         self.api_key = api_key or os.getenv("FINNHUB_API_KEY")
         self.min_price = min_price
@@ -79,6 +83,9 @@ class FinnhubScreener:
         self.min_rvol = min_rvol
         self.min_volume = min_volume
         self.max_workers = max_workers
+        self.float_mode = float_mode
+        self.last_status = "ok"
+        self.last_error = None
 
         if not FINNHUB_AVAILABLE:
             logger.warning("finnhub-python package not installed. Run: pip install finnhub-python")
@@ -101,6 +108,12 @@ class FinnhubScreener:
 
             price = float(quote["c"])
             change_pct = float(quote.get("dp", 0.0))
+            quote_timestamp = quote.get("t")
+            now_epoch = int(datetime.now(timezone.utc).timestamp())
+            if not isinstance(quote_timestamp, (int, float)) or quote_timestamp <= 0 or now_epoch - quote_timestamp > 15 * 60:
+                self.last_status = "stale"
+                self.last_error = f"Finnhub quote was missing a current timestamp or stale for {symbol}."
+                return None
 
             # Quick price and change pre-filter
             if not (self.min_price <= price <= self.max_price):
@@ -111,53 +124,85 @@ class FinnhubScreener:
             # 2. Company profile (Market Cap & Float)
             profile = self.client.company_profile2(symbol=symbol) or {}
             mcap_m = profile.get("marketCapitalization")  # Already in Millions USD
-            float_m = profile.get("floatingShare") or profile.get("shareOutstanding")  # In Millions
-
-            # If missing float, estimate from mcap / price
-            if float_m is None and mcap_m and price > 0:
-                float_m = mcap_m / price
+            float_m = profile.get("floatingShare")  # Explicit public float only, in millions
+            if not isinstance(mcap_m, (int, float)) or not math.isfinite(mcap_m) or mcap_m <= 0:
+                self.last_status = "incomplete"
+                self.last_error = f"Finnhub market capitalization was unavailable for {symbol}."
+                return None
+            if not isinstance(float_m, (int, float)) or not math.isfinite(float_m) or float_m <= 0:
+                float_m = None
 
             # Filter market cap and float
             if mcap_m is None or mcap_m > self.max_market_cap:
                 return None
-            if float_m is None or float_m > self.max_float:
+            if float_m is not None and float_m > self.max_float:
                 return None
+            if float_m is None and self.float_mode == "strict":
+                self.last_status = "incomplete"
+                self.last_error = f"Finnhub public float was unavailable for {symbol}; strict mode excluded it."
+                return None
+            if float_m is None:
+                self.last_status = "incomplete"
+                self.last_error = f"Finnhub public float is unknown for {symbol}; discovery mode retained it as unverified."
 
-            # 3. Baseline Volume & Metrics
-            avg_vol_m = 0.1  # Default 100k
-            try:
-                metrics = self.client.company_basic_financials(symbol, "all") or {}
-                metric_dict = metrics.get("metric", {})
-                avg_vol_m = metric_dict.get("10DayAverageTradingVolume", 0.1) or 0.1
-            except Exception:
-                pass
-
-            avg_vol = int(avg_vol_m * 1_000_000)
-            # Estimate session volume from day high/low range or baseline
-            # (Finnhub quote provides h, l, o, pc, c)
-            est_volume = int(avg_vol * max(1.0, abs(change_pct) / 5.0))
-            rvol = round(est_volume / avg_vol, 1) if avg_vol > 0 else 1.0
+            # Finnhub quote has no session volume. Use daily candles only when
+            # available, calculating RVOL against prior full-day candles.
+            now = int(datetime.now(timezone.utc).timestamp())
+            start = int((datetime.now(timezone.utc) - timedelta(days=20)).timestamp())
+            candles = self.client.stock_candles(symbol, "D", start, now) or {}
+            volumes = candles.get("v") if candles.get("s") == "ok" else None
+            timestamps = candles.get("t") if candles.get("s") == "ok" else None
+            if not isinstance(volumes, list) or len(volumes) < 2 or not isinstance(timestamps, list) or len(timestamps) != len(volumes):
+                self.last_status = "incomplete"
+                self.last_error = "Finnhub daily candles were unavailable; candidates without observed volume and baseline were excluded."
+                return None
+            if now - int(timestamps[-1]) > 24 * 60 * 60:
+                self.last_status = "incomplete"
+                self.last_error = "Finnhub daily candle volume was stale; candidate was excluded."
+                return None
+            current_volume = int(volumes[-1])
+            baseline_values = [float(value) for value in volumes[:-1] if isinstance(value, (int, float)) and value > 0]
+            if current_volume <= 0 or not baseline_values:
+                self.last_status = "incomplete"
+                self.last_error = "Finnhub daily candles did not contain valid volume data."
+                return None
+            avg_vol = sum(baseline_values) / len(baseline_values)
+            rvol = current_volume / avg_vol
+            if current_volume < self.min_volume or rvol < self.min_rvol:
+                return None
 
             return {
                 "Ticker": symbol,
                 "Price": price,
                 "Today's Change %": change_pct,
-                "Volume": est_volume,
+                "Volume": current_volume,
                 "RVOL": rvol,
                 "Market Cap ($M)": round(float(mcap_m), 2),
-                "Est. Float (M)": round(float(float_m), 2),
+                "Float (M)": round(float(float_m), 2) if float_m is not None else None,
+                "Float Status": "verified" if float_m is not None else "unverified",
+                "Quote Source": "Finnhub",
+                "Volume Source": "Finnhub daily candles",
+                "RVOL Type": "daily",
+                "Quote Timestamp": datetime.fromtimestamp(quote_timestamp, timezone.utc).isoformat(),
+                "Data Freshness": "current (under 15 minutes)",
             }
 
         except Exception as e:
+            self.last_status = "incomplete"
+            self.last_error = f"Finnhub data unavailable for {symbol} ({type(e).__name__})."
             logger.debug(f"Error fetching Finnhub data for {symbol}: {e}")
             return None
 
     def scan(self, watchlist: Optional[List[str]] = None, demo: bool = False) -> pd.DataFrame:
         """Run the Finnhub screener."""
-        if demo or not self.client:
-            if not demo and not self.client:
-                logger.warning("No Finnhub client or API key found. Using demo data.")
+        self.last_status = "ok"
+        self.last_error = None
+        if demo:
             return self._run_demo()
+        if not self.client:
+            self.last_status = "failed"
+            self.last_error = "Finnhub client or API key is unavailable."
+            return pd.DataFrame()
 
         symbols = watchlist or ACTIVE_WATCHLIST
         logger.info(f"Scanning {len(symbols)} symbols via Finnhub API...")
@@ -172,9 +217,7 @@ class FinnhubScreener:
 
         if not matches:
             logger.info("No symbols currently matched the exact momentum criteria on Finnhub.")
-            return pd.DataFrame(
-                columns=["Ticker", "Price", "Today's Change %", "Volume", "RVOL", "Market Cap ($M)", "Est. Float (M)"]
-            )
+            return pd.DataFrame(columns=["Ticker", "Price", "Today's Change %", "Volume", "RVOL", "Market Cap ($M)", "Float (M)"])
 
         df = pd.DataFrame(matches)
         df = df.sort_values(by="Today's Change %", ascending=False).reset_index(drop=True)
@@ -193,7 +236,7 @@ class FinnhubScreener:
                         "Volume": d["volume"],
                         "RVOL": rvol,
                         "Market Cap ($M)": d["market_cap"],
-                        "Est. Float (M)": d["float"],
+                        "Float (M)": d["float"],
                     })
         df = pd.DataFrame(filtered)
         if not df.empty:
@@ -211,7 +254,8 @@ class FinnhubScreener:
         display_df["Volume"] = df["Volume"].apply(lambda v: f"{int(v):,}")
         display_df["RVOL"] = df["RVOL"].apply(lambda r: f"{r:.1f}x")
         display_df["Market Cap ($M)"] = df["Market Cap ($M)"].apply(lambda m: f"${m:,.2f}")
-        display_df["Est. Float (M)"] = df["Est. Float (M)"].apply(lambda f: f"{f:,.2f}")
+        if "Float (M)" in df:
+            display_df["Float (M)"] = df["Float (M)"].apply(lambda f: f"{f:,.2f}" if pd.notna(f) else "N/A")
         return display_df
 
 
@@ -246,6 +290,10 @@ def main():
     parser.add_argument("--max-float", type=float, default=10.0, help="Maximum float in Millions")
     parser.add_argument("--max-market-cap", type=float, default=100.0, help="Maximum market cap in Millions")
     parser.add_argument("-k", "--api-key", default=os.getenv("FINNHUB_API_KEY"), help="Finnhub API Key")
+    parser.add_argument("--float-mode", choices=["strict", "discovery"], default="strict")
+    parser.add_argument("--watchlist", help="Ticker list file (one symbol per line or comma-separated)")
+    parser.add_argument("--export", help="Write scan results and metadata to CSV")
+    parser.add_argument("--history", help="Append scan results and metadata to a CSV history file")
 
     args = parser.parse_args()
 
@@ -256,9 +304,28 @@ def main():
         min_change_pct=args.min_change,
         max_float=args.max_float,
         max_market_cap=args.max_market_cap,
+        float_mode=args.float_mode,
     )
-    df = screener.scan(demo=args.demo)
+    watchlist, invalid = load_watchlist(args.watchlist) if args.watchlist else (None, [])
+    if invalid:
+        print("[WARNING] Ignoring invalid watchlist entries: " + ", ".join(invalid))
+    if args.watchlist and not watchlist:
+        parser.error("watchlist contains no valid ticker symbols")
+    df = screener.scan(watchlist=watchlist, demo=args.demo)
     print_results(df)
+    if screener.last_status != "ok":
+        print(f"[SCAN STATUS: {screener.last_status}] {screener.last_error or ''}")
+    if watchlist:
+        missing = missing_symbols(watchlist, df.get("Ticker", []))
+        if missing:
+            print("[WARNING] No qualifying provider result for: " + ", ".join(missing))
+    metadata = scan_metadata("finnhub", {"min_price": args.min_price, "max_price": args.max_price, "min_change": args.min_change, "min_volume": screener.min_volume, "min_rvol": screener.min_rvol, "max_float_m": args.max_float, "max_market_cap_m": args.max_market_cap, "float_mode": args.float_mode, "watchlist": args.watchlist or "built-in universe"}, status=screener.last_status, message=screener.last_error)
+    if args.export:
+        write_scan(df, args.export, metadata)
+        print(f"CSV export saved: {args.export}")
+    if args.history:
+        write_scan(df, args.history, metadata, append=True)
+        print(f"Scan appended to history: {args.history}")
 
 
 if __name__ == "__main__":

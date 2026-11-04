@@ -14,6 +14,7 @@ import time
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
 from market_data import market_session
+from scan_io import load_watchlist, missing_symbols, scan_metadata, write_scan
 
 # Load .env file if available
 try:
@@ -42,6 +43,9 @@ DEMO_DATA = [
 class MiddayScreener:
     def __init__(self, api_key=None, min_volume=500000, source="polygon", min_rvol=5.0, float_mode="strict"):
         self.min_volume = min_volume
+        self.watchlist = None
+        self._last_raw_data = []
+        self._missing_rvol_baselines = 0
         if isinstance(source, (int, float)) and min_rvol == 5.0:
             min_rvol = source
             source = "polygon"
@@ -119,8 +123,11 @@ class MiddayScreener:
 
         tickers = response.json().get("tickers", [])
         parsed = []
+        allowed = set(self.watchlist) if self.watchlist else None
         for t in tickers:
             ticker = t.get("ticker")
+            if allowed is not None and ticker not in allowed:
+                continue
             day = t.get("day", {})
             prev_day = t.get("prevDay", {})
             price = day.get("c") or day.get("vw", 0)
@@ -137,8 +144,6 @@ class MiddayScreener:
             if (2.00 <= price <= 10.00) and (change_pct >= 10.0) and (volume >= self.min_volume):
                 avg_vol = self.fetch_polygon_historical_avg_volume(ticker, days=10)
                 avg_vol_attempted = True
-                if avg_vol is None:
-                    avg_vol = 100000
 
             parsed.append({
                 "ticker": ticker,
@@ -152,7 +157,7 @@ class MiddayScreener:
             })
         return parsed
 
-    def fetch_yfinance_data(self, limit=250):
+    def fetch_yfinance_data(self, limit=250, symbols=None):
         if not YFINANCE_AVAILABLE:
             self.last_status = "failed"
             self.last_error = "yfinance package is required for live Yahoo Finance data."
@@ -163,19 +168,37 @@ class MiddayScreener:
         results = []
         # Yahoo's screener provides dynamic discovery but has limited, opaque
         # coverage and is not a guaranteed market-wide feed.
-        try:
-            query = yf.EquityQuery("and", [
-                yf.EquityQuery("gte", ["intradayprice", 2.0]),
-                yf.EquityQuery("lte", ["intradayprice", 10.0]),
-                yf.EquityQuery("gte", ["dayvolume", self.min_volume]),
-                yf.EquityQuery("gte", ["percentchange", 10.0]),
-            ])
-            quotes = yf.screen(query, size=limit).get("quotes", [])
-        except Exception as exc:
-            self.last_status = "failed"
-            self.last_error = f"Yahoo Finance discovery failed ({type(exc).__name__})."
-            print(f"[!] {self.last_error}")
-            return []
+        if symbols is not None:
+            quotes = []
+            for symbol in symbols:
+                try:
+                    info = yf.Ticker(symbol).info or {}
+                    price = info.get("regularMarketPrice")
+                    change = info.get("regularMarketChangePercent")
+                    volume = info.get("regularMarketVolume")
+                    if price is not None and change is not None and volume is not None:
+                        quotes.append({
+                            "symbol": symbol, "regularMarketPrice": price,
+                            "regularMarketChangePercent": change, "regularMarketVolume": volume,
+                            "regularMarketTime": info.get("regularMarketTime"),
+                            "averageVolume10days": info.get("averageVolume10days") or info.get("averageVolume"),
+                        })
+                except Exception:
+                    continue
+        else:
+            try:
+                query = yf.EquityQuery("and", [
+                    yf.EquityQuery("gte", ["intradayprice", 2.0]),
+                    yf.EquityQuery("lte", ["intradayprice", 10.0]),
+                    yf.EquityQuery("gte", ["dayvolume", self.min_volume]),
+                    yf.EquityQuery("gte", ["percentchange", 10.0]),
+                ])
+                quotes = yf.screen(query, size=limit).get("quotes", [])
+            except Exception as exc:
+                self.last_status = "failed"
+                self.last_error = f"Yahoo Finance discovery failed ({type(exc).__name__})."
+                print(f"[!] {self.last_error}")
+                return []
 
         for quote in quotes:
             symbol = quote.get("symbol")
@@ -189,7 +212,7 @@ class MiddayScreener:
                 volume = quote.get("regularMarketVolume")
                 market_cap = info.get("marketCap")
                 float_shares = info.get("floatShares")
-                avg_vol = info.get("averageVolume10days") or info.get("averageVolume")
+                avg_vol = quote.get("averageVolume10days") or info.get("averageVolume10days") or info.get("averageVolume")
                 if not curr_price or change_pct is None or volume is None:
                     continue
 
@@ -241,7 +264,10 @@ class MiddayScreener:
         # Finnhub exposes symbol lists, not a market-wide momentum screen. Keep
         # discovery dynamic and bounded rather than issuing thousands of calls.
         try:
-            discovered = self.fetch_yfinance_data(limit=self.finnhub_candidate_limit)
+            discovered = (
+                self.fetch_yfinance_data(symbols=self.watchlist)
+                if self.watchlist else self.fetch_yfinance_data(limit=self.finnhub_candidate_limit)
+            )
         except Exception:
             self.last_status = "failed"
             self.last_error = "Yahoo Finance candidate discovery failed for Finnhub enrichment."
@@ -401,12 +427,14 @@ class MiddayScreener:
         if demo:
             raw_data = DEMO_DATA
         elif self.source == "yfinance":
-            raw_data = self.fetch_yfinance_data()
+            raw_data = self.fetch_yfinance_data(symbols=self.watchlist) if self.watchlist else self.fetch_yfinance_data()
         elif self.source == "finnhub":
             raw_data = self.fetch_finnhub_data()
         else:
             raw_data = self.fetch_polygon_data()
 
+        self._last_raw_data = raw_data
+        self._missing_rvol_baselines = 0
         filtered = []
         for item in raw_data:
             price = item.get("price") or 0
@@ -429,14 +457,13 @@ class MiddayScreener:
                 if (2.00 <= price <= 10.00) and (change_pct >= 10.0) and (current_volume >= self.min_volume):
                     avg_baseline_volume = self.fetch_polygon_historical_avg_volume(ticker, days=10)
                     item["avg_volume_attempted"] = True
-                    if avg_baseline_volume is None:
-                        avg_baseline_volume = 100000
                     item["avg_volume"] = avg_baseline_volume
 
-            if avg_baseline_volume is None and attempted:
-                avg_baseline_volume = 100000
-
             if not isinstance(avg_baseline_volume, (int, float)) or not math.isfinite(avg_baseline_volume) or avg_baseline_volume <= 0:
+                if attempted or item.get("avg_volume_attempted") or (
+                    2.00 <= price <= 10.00 and change_pct >= 10.0 and current_volume >= self.min_volume
+                ):
+                    self._missing_rvol_baselines += 1
                 continue
 
             # Calculate Relative Volume multiplier
@@ -477,6 +504,9 @@ class MiddayScreener:
                         })
 
         df = pd.DataFrame(filtered)
+        if self._missing_rvol_baselines and self.last_status == "ok":
+            self.last_status = "incomplete"
+            self.last_error = f"Historical volume was unavailable for {self._missing_rvol_baselines} candidate(s); those candidates were excluded from RVOL screening."
         if not df.empty:
             if sort_by == "change":
                 sort_col = "_raw_change"
@@ -498,6 +528,9 @@ if __name__ == "__main__":
     parser.add_argument("--min-rvol", type=float, default=5.0, help="Minimum Relative Volume (RVOL) multiplier (default: 5.0x)")
     parser.add_argument("--float-mode", choices=["strict", "discovery"], default="strict", help="Strictly require public float or include unknown float flagged")
     parser.add_argument("--sort-by", type=str, default="volume", choices=["volume", "change", "rvol"], help="Sort order: volume, change, or rvol")
+    parser.add_argument("--watchlist", help="Ticker list file (one symbol per line or comma-separated)")
+    parser.add_argument("--export", help="Write scan results and metadata to CSV")
+    parser.add_argument("--history", help="Append scan results and metadata to a CSV history file")
     parser.add_argument(
         "-k",
         "--api-key",
@@ -515,7 +548,21 @@ if __name__ == "__main__":
         min_rvol=args.min_rvol,
         float_mode=args.float_mode,
     )
+    requested = []
+    if args.watchlist:
+        requested, invalid = load_watchlist(args.watchlist)
+        if invalid:
+            print("[WARNING] Ignoring invalid watchlist entries: " + ", ".join(invalid))
+        if not requested:
+            parser.error("watchlist contains no valid ticker symbols")
+        screener.watchlist = requested
     df_result = screener.run(demo=args.demo, sort_by=args.sort_by)
+
+    if requested:
+        returned = {row.get("ticker") for row in screener._last_raw_data}
+        missing = missing_symbols(requested, returned)
+        if missing:
+            print("[WARNING] No provider data returned for: " + ", ".join(missing))
 
     print("\n=== MIDDAY MOMENTUM WATCHLIST ===")
     if screener.last_error and not args.demo:
@@ -532,5 +579,20 @@ if __name__ == "__main__":
         print(display.to_string(index=False))
     else:
         print("No stocks currently match the exact midday momentum criteria.")
+    if screener.last_status != "ok":
+        print(f"[SCAN STATUS: {screener.last_status}] {screener.last_error or ''}")
+    metadata = scan_metadata(screener.source, {
+        "min_price": 2.0, "max_price": 10.0, "min_change_pct": 10.0,
+        "min_volume": args.min_volume, "min_rvol": args.min_rvol,
+        "max_float": 10_000_000, "max_market_cap": 100_000_000,
+        "float_mode": args.float_mode, "sort_by": args.sort_by,
+        "watchlist": args.watchlist or "provider discovery",
+    }, status=screener.last_status, message=screener.last_error)
+    if args.export:
+        write_scan(df_result, args.export, metadata)
+        print(f"CSV export saved: {args.export}")
+    if args.history:
+        write_scan(df_result, args.history, metadata, append=True)
+        print(f"Scan appended to history: {args.history}")
     print("")
 

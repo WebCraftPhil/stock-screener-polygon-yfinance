@@ -22,6 +22,7 @@ import logging
 import math
 from typing import List, Dict, Any, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from scan_io import load_watchlist, missing_symbols, scan_metadata, write_scan
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -304,7 +305,7 @@ class PolygonScreener:
 
         return enriched_results
 
-    def scan(self) -> pd.DataFrame:
+    def scan(self, watchlist=None) -> pd.DataFrame:
         """
         Execute the full screening workflow:
           1. Fetch market snapshot
@@ -315,6 +316,9 @@ class PolygonScreener:
           6. Construct formatted output DataFrame
         """
         snapshot = self.fetch_all_tickers_snapshot()
+        if watchlist:
+            allowed = set(watchlist)
+            snapshot = [item for item in snapshot if item.get("ticker") in allowed]
         candidates = self.filter_snapshot_candidates(snapshot)
         matches = self.enrich_and_filter_fundamentals(candidates)
 
@@ -582,6 +586,9 @@ def main():
         action="store_true",
         help="Run screener with sample mock data to demonstrate output without an API key",
     )
+    parser.add_argument("--watchlist", help="Ticker list file (one symbol per line or comma-separated)")
+    parser.add_argument("--export", help="Write scan results and metadata to CSV")
+    parser.add_argument("--history", help="Append scan results and metadata to a CSV history file")
 
     args = parser.parse_args()
 
@@ -616,8 +623,24 @@ def main():
         sys.exit(1)
 
     try:
-        df = screener.scan()
+        watchlist, invalid = load_watchlist(args.watchlist) if args.watchlist else (None, [])
+        if invalid:
+            print("[WARNING] Ignoring invalid watchlist entries: " + ", ".join(invalid))
+        if args.watchlist and not watchlist:
+            parser.error("watchlist contains no valid ticker symbols")
+        df = screener.scan(watchlist)
         print_screener_results(df, screener=screener)
+        if watchlist:
+            missing = missing_symbols(watchlist, df.get("Ticker", []))
+            if missing:
+                print("[WARNING] No qualifying provider result for: " + ", ".join(missing))
+        metadata = scan_metadata("massive", {"min_price": args.min_price, "max_price": args.max_price, "min_volume": args.min_volume, "max_float": args.max_float, "max_market_cap": args.max_market_cap, "min_gap": args.min_gap, "float_mode": args.float_mode, "watchlist": args.watchlist or "market snapshot"})
+        if args.export:
+            write_scan(df, args.export, metadata)
+            print(f"CSV export saved: {args.export}")
+        if args.history:
+            write_scan(df, args.history, metadata, append=True)
+            print(f"Scan appended to history: {args.history}")
 
     except PermissionError as pe:
         logger.error(f"Authentication / Permissions Error: {pe}")
