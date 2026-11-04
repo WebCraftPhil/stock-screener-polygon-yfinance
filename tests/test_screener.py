@@ -623,5 +623,46 @@ def test_fetch_polygon_historical_avg_volume_and_rvol_gate():
         assert params.get("sort") == "desc"
 
 
+def test_polygon_historical_avg_volume_skips_repeat_requests_on_none():
+    """Verify Polygon flow skips repeat historical volume lookups after None and uses fallback."""
+    from midday_screener import MiddayScreener
+
+    screener = MiddayScreener(api_key="TEST_KEY", source="polygon", min_volume=500_000, min_rvol=5.0, float_mode="strict")
+
+    snapshot_resp = Mock(status_code=200)
+    snapshot_resp.json.return_value = {
+        "tickers": [{
+            "ticker": "FAIL_AGGS",
+            "day": {"c": 5.0, "v": 1_000_000},
+            "prevDay": {"c": 4.0},
+        }]
+    }
+    aggs_resp = Mock(status_code=404)
+    details_resp = Mock(status_code=200)
+    details_resp.json.return_value = {
+        "results": {"market_cap": 50_000_000, "free_float": 5_000_000}
+    }
+
+    def mock_get(url, *args, **kwargs):
+        if "snapshot" in url:
+            return snapshot_resp
+        elif "aggs" in url:
+            return aggs_resp
+        elif "reference" in url:
+            return details_resp
+        return Mock(status_code=404)
+
+    with patch("midday_screener.requests.get", side_effect=mock_get) as pget:
+        df = screener.run(demo=False)
+        aggs_calls = [c for c in pget.call_args_list if "aggs" in c[0][0]]
+        # Exactly 1 call to aggs, no repeat request after None
+        assert len(aggs_calls) == 1
+        # Proceeded to fallback baseline (100000), calculated RVOL = 10.0x, passed screener
+        assert len(df) == 1
+        assert df.iloc[0]["Ticker"] == "FAIL_AGGS"
+        assert df.iloc[0]["RVOL"] == 10.0
+
+
+
 
 

@@ -130,6 +130,8 @@ class MiddayScreener:
             if (2.00 <= price <= 10.00) and (change_pct >= 10.0) and (volume >= self.min_volume):
                 avg_vol = self.fetch_polygon_historical_avg_volume(ticker, days=10)
                 avg_vol_attempted = True
+                if avg_vol is None:
+                    avg_vol = 100000
 
             parsed.append({
                 "ticker": ticker,
@@ -407,8 +409,13 @@ class MiddayScreener:
             ):
                 if (2.00 <= price <= 10.00) and (change_pct >= 10.0) and (current_volume >= self.min_volume):
                     avg_baseline_volume = self.fetch_polygon_historical_avg_volume(ticker, days=10)
-                    item["avg_volume"] = avg_baseline_volume
                     item["avg_volume_attempted"] = True
+                    if avg_baseline_volume is None:
+                        avg_baseline_volume = 100000
+                    item["avg_volume"] = avg_baseline_volume
+
+            if avg_baseline_volume is None and attempted:
+                avg_baseline_volume = 100000
 
             if not isinstance(avg_baseline_volume, (int, float)) or not math.isfinite(avg_baseline_volume) or avg_baseline_volume <= 0:
                 continue
