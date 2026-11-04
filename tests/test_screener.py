@@ -544,6 +544,44 @@ def test_midday_yahoo_uses_dynamic_equity_query():
     screen.assert_called_once()
 
 
+def test_midday_finnhub_quote_and_profile_are_bounded_and_attributed():
+    from datetime import datetime, timezone
+    from midday_screener import MiddayScreener
+    scanner = MiddayScreener(api_key="TEST_FINNHUB_KEY", source="finnhub", float_mode="discovery")
+    scanner.fetch_yfinance_data = lambda limit=250: [{
+        "ticker": "ABC", "price": 5.0, "change_pct": 12.0, "volume": 1_000_000,
+        "avg_volume": 100_000, "market_cap": None, "float": None,
+    }]
+    now = int(datetime.now(timezone.utc).timestamp())
+    def response_for(url, **kwargs):
+        response = Mock(status_code=200)
+        response.json.return_value = (
+            {"c": 5.2, "dp": 14, "t": now} if url.endswith("/quote") else
+            {"ticker": "ABC", "marketCapitalization": 25, "shareOutstanding": 8}
+        )
+        return response
+    with patch("midday_screener.requests.get", side_effect=response_for) as get, patch("midday_screener.time.sleep"):
+        result = scanner.run()
+    assert result.iloc[0]["Ticker"] == "ABC"
+    assert result.iloc[0]["Quote Source"] == "Finnhub"
+    assert result.iloc[0]["Volume Source"] == "Yahoo Finance"
+    assert result.iloc[0]["Market Cap ($M)"] == 25
+    assert result.iloc[0]["Shares Outstanding (M)"] == 8
+    assert pd.isna(result.iloc[0]["Float (M)"])
+    assert result.iloc[0]["Float Status"] == "unverified"
+    assert len(get.call_args_list) == 2
+    assert all(call.kwargs["params"]["token"] == "TEST_FINNHUB_KEY" for call in get.call_args_list)
+
+
+def test_finnhub_request_errors_do_not_expose_token():
+    from midday_screener import MiddayScreener
+    scanner = MiddayScreener(api_key="TOP_SECRET", source="finnhub")
+    with patch("midday_screener.requests.get", side_effect=ConnectionError("url contained TOP_SECRET")):
+        with pytest.raises(RuntimeError) as exc:
+            scanner._finnhub_json("quote", {"symbol": "ABC"})
+    assert "TOP_SECRET" not in str(exc.value)
+
+
 def test_fetch_polygon_historical_avg_volume_and_rvol_gate():
     """Verify Polygon path fetches 10-day historical daily volume average before RVOL gate."""
     from midday_screener import MiddayScreener

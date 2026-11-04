@@ -9,7 +9,16 @@ python -m pip install -r requirements.txt
 python screener.py
 python midday_screener.py --source yfinance
 python midday_screener.py --source yfinance --float-mode discovery --sort-by rvol
+python midday_screener.py --source finnhub --float-mode discovery
 ```
+
+For API-backed sources, create `.env` from the template if you do not already have one, then add the key for the provider you plan to use:
+
+```bash
+cp -n .env.example .env
+```
+
+`.env` is ignored by Git. Keep real credentials there or in environment variables; do not commit them. `python-dotenv` loads `.env` for the scripts. VS Code users can enable terminal injection with `python.terminal.useEnvFile` and point `python.envFile` at `${workspaceFolder}/.env`.
 
 Yahoo is free and needs no key. Its screener returns a provider-selected, limited result set, not comprehensive US market coverage. Yahoo does not provide a dependable extended-hours tape through this implementation, so it uses regular-market fields and does not claim premarket price, volume, or gap. Timestamped stale Yahoo quotes are skipped. Quote delay can be unknown.
 
@@ -24,9 +33,11 @@ python midday_screener.py --source polygon
 
 Configure `MASSIVE_API_KEY` or `POLYGON_API_KEY` in the environment or `.env`. Market snapshots and fundamentals may be plan-limited. Providers do not consistently expose public float or a separate extended-hours tape. Unknown values remain unknown; float is never derived from shares outstanding or market cap. Use `--float-mode strict|discovery`: strict excludes unknown float; discovery retains unknown float flagged `unverified`. Public float means shares available for public trading. Shares outstanding includes restricted and insider holdings. Market capitalization is equity value. These fields are distinct.
 
+The optional Finnhub midday source reads `FINNHUB_API_KEY` from `.env`. It uses Yahoo Finance's dynamically discovered results as a capped candidate list (up to 20 symbols), then requests Finnhub quote and company-profile data. This is not a full-market Finnhub scan. Finnhub profile data includes market capitalization and shares outstanding; public float is only populated if Yahoo provides its explicit `floatShares` field, otherwise strict mode excludes it or discovery mode flags it unknown. Quote and volume sources are shown separately because Finnhub's quote endpoint does not supply session volume in the quote response. Delayed status can be unknown. Finnhub calls are paced and transient failures are bounded; API access still depends on your account entitlement.
+
 ## Sessions and relative volume
 
-Premarket gap is the latest valid premarket trade versus the prior regular close. Regular-session gain is current regular-session price versus prior regular close. They are different measures. Current Yahoo paths report regular-session gain only. Aggregate daily snapshot volume must not be presented as premarket volume without extended-hours trade data. `market_data.py` labels ET session intervals; `exchange-calendars` supports holiday checks.
+Premarket gap is the latest valid premarket trade versus the prior regular close. Regular-session gain is current regular-session price versus prior regular close. They are different measures. Current Yahoo paths report regular-session gain only. Aggregate daily snapshot volume must not be presented as premarket volume without extended-hours trade data. `market_data.py` provides ET clock labels and an NYSE calendar helper; this does not create premarket prices or volume, and a session label does not verify market-wide holiday coverage.
 
 Midday RVOL is labelled **daily**: current cumulative session volume divided by the mean of available historical full-day volumes. It is not time-of-day-adjusted RVOL. Missing or invalid history excludes a candidate. No fixed baseline is substituted. Intraday historical baselines are not currently implemented.
 

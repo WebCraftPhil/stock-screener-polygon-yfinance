@@ -11,7 +11,9 @@ import requests
 import pandas as pd
 import math
 import time
+from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
+from market_data import market_session
 
 # Load .env file if available
 try:
@@ -39,17 +41,18 @@ DEMO_DATA = [
 
 class MiddayScreener:
     def __init__(self, api_key=None, min_volume=500000, source="polygon", min_rvol=5.0, float_mode="strict"):
-        self.api_key = (
-            api_key
-            or os.getenv("MASSIVE_API_KEY")
-            or os.getenv("POLYGON_API_KEY")
-        )
         self.min_volume = min_volume
         if isinstance(source, (int, float)) and min_rvol == 5.0:
             min_rvol = source
             source = "polygon"
         self.source = source
         self.float_mode = float_mode
+        if self.source == "finnhub":
+            self.api_key = api_key or os.getenv("FINNHUB_API_KEY")
+        else:
+            self.api_key = api_key or os.getenv("MASSIVE_API_KEY") or os.getenv("POLYGON_API_KEY")
+        self.finnhub_candidate_limit = 20
+        self._last_finnhub_request = 0.0
         try:
             self.min_rvol = float(min_rvol)
         except (ValueError, TypeError):
@@ -140,7 +143,7 @@ class MiddayScreener:
             })
         return parsed
 
-    def fetch_yfinance_data(self):
+    def fetch_yfinance_data(self, limit=250):
         if not YFINANCE_AVAILABLE:
             self.last_status = "failed"
             self.last_error = "yfinance package is required for live Yahoo Finance data."
@@ -158,7 +161,7 @@ class MiddayScreener:
                 yf.EquityQuery("gte", ["dayvolume", self.min_volume]),
                 yf.EquityQuery("gte", ["percentchange", 10.0]),
             ])
-            quotes = yf.screen(query, size=250).get("quotes", [])
+            quotes = yf.screen(query, size=limit).get("quotes", [])
         except Exception as exc:
             self.last_status = "failed"
             self.last_error = f"Yahoo Finance discovery failed ({type(exc).__name__})."
@@ -193,6 +196,100 @@ class MiddayScreener:
             except Exception:
                 continue
         return results
+
+    def _finnhub_json(self, path, params):
+        """Fetch a Finnhub resource without ever exposing its token in errors."""
+        if not self.api_key:
+            raise ValueError("Finnhub API key is not configured.")
+        # Stay below the common 60 requests/minute entry tier even if HTTP
+        # responses are unusually fast. The per-run candidate cap is 20.
+        wait_for = 1.05 - (time.monotonic() - self._last_finnhub_request)
+        if wait_for > 0:
+            time.sleep(wait_for)
+        self._last_finnhub_request = time.monotonic()
+        try:
+            response = self._get(
+                f"https://finnhub.io/api/v1/{path}",
+                params={**params, "token": self.api_key}, timeout=12,
+            )
+        except requests.exceptions.RequestException as exc:
+            raise RuntimeError(f"Finnhub request failed ({type(exc).__name__}).") from None
+        if response.status_code != 200:
+            raise RuntimeError(f"Finnhub returned HTTP {response.status_code} for {path}.")
+        try:
+            return response.json()
+        except (ValueError, requests.exceptions.JSONDecodeError):
+            raise RuntimeError(f"Finnhub returned invalid JSON for {path}.") from None
+
+    def fetch_finnhub_data(self):
+        """Use Yahoo's bounded screener for discovery, then Finnhub per-symbol quotes/profile."""
+        if not self.api_key:
+            self.last_status = "failed"
+            self.last_error = "Finnhub API key missing. Set FINNHUB_API_KEY in .env or pass --api-key."
+            return []
+        # Finnhub exposes symbol lists, not a market-wide momentum screen. Keep
+        # discovery dynamic and bounded rather than issuing thousands of calls.
+        try:
+            discovered = self.fetch_yfinance_data(limit=self.finnhub_candidate_limit)
+        except Exception:
+            self.last_status = "failed"
+            self.last_error = "Yahoo Finance candidate discovery failed for Finnhub enrichment."
+            return []
+        if not discovered:
+            return []
+
+        rows = []
+        failures = 0
+        stale_quotes = 0
+        for item in discovered:
+            symbol = item["ticker"]
+            try:
+                quote = self._finnhub_json("quote", {"symbol": symbol})
+                profile = self._finnhub_json("stock/profile2", {"symbol": symbol})
+                timestamp = quote.get("t")
+                if not isinstance(timestamp, (int, float)) or timestamp <= 0:
+                    failures += 1
+                    continue
+                quote_dt = datetime.fromtimestamp(timestamp, timezone.utc)
+                if (datetime.now(timezone.utc) - quote_dt).total_seconds() > 15 * 60:
+                    stale_quotes += 1
+                    continue
+                price, change = quote.get("c"), quote.get("dp")
+                if not isinstance(price, (int, float)) or not isinstance(change, (int, float)):
+                    failures += 1
+                    continue
+                # Finnhub profile marketCapitalization and shareOutstanding are
+                # reported in millions. Public float is deliberately not inferred.
+                cap_m = profile.get("marketCapitalization")
+                shares_m = profile.get("shareOutstanding")
+                item.update({
+                    "price": price,
+                    "change_pct": change,
+                    "market_cap": cap_m * 1_000_000 if isinstance(cap_m, (int, float)) and math.isfinite(cap_m) and cap_m > 0 else None,
+                    "shares_outstanding": shares_m * 1_000_000 if isinstance(shares_m, (int, float)) and math.isfinite(shares_m) and shares_m > 0 else None,
+                    "quote_timestamp": quote_dt.isoformat(),
+                    "session": market_session(quote_dt),
+                    "quote_source": "Finnhub",
+                    "volume_source": "Yahoo Finance",
+                    "float_source": "Yahoo Finance floatShares" if item.get("float") else None,
+                    "market_cap_source": "Finnhub profile2",
+                })
+                rows.append(item)
+            except (RuntimeError, ValueError, TypeError, OverflowError):
+                failures += 1
+        if failures and not rows:
+            self.last_status = "failed"
+            self.last_error = "Finnhub quote/profile requests failed for all discovered candidates."
+        elif failures:
+            self.last_status = "incomplete"
+            self.last_error = f"Finnhub data incomplete for {failures} candidate(s)."
+        elif stale_quotes and not rows:
+            self.last_status = "stale"
+            self.last_error = "All Finnhub quote timestamps were stale."
+        elif stale_quotes:
+            self.last_status = "incomplete"
+            self.last_error = f"Finnhub quotes were stale for {stale_quotes} candidate(s)."
+        return rows
 
     def fetch_polygon_historical_avg_volume(self, ticker: str, days: int = 10):
         if not self.api_key:
@@ -284,6 +381,8 @@ class MiddayScreener:
             raw_data = DEMO_DATA
         elif self.source == "yfinance":
             raw_data = self.fetch_yfinance_data()
+        elif self.source == "finnhub":
+            raw_data = self.fetch_finnhub_data()
         else:
             raw_data = self.fetch_polygon_data()
 
@@ -335,9 +434,17 @@ class MiddayScreener:
                             "Volume": enriched["volume"],
                             "RVOL": rvol,
                             "Market Cap ($M)": round(enriched['market_cap'] / 1_000_000, 2),
-                            "Float (M)": round(enriched['float'] / 1_000_000, 2) if enriched['float'] is not None else "N/A",
+                            "Float (M)": round(enriched['float'] / 1_000_000, 2) if enriched['float'] is not None else None,
                             "Float Status": "verified" if enriched['float'] is not None else "unverified",
                             "RVOL Type": "daily",
+                            "Quote Source": enriched.get("quote_source", "Yahoo Finance" if self.source == "yfinance" else "Polygon"),
+                            "Volume Source": enriched.get("volume_source", "Yahoo Finance" if self.source == "yfinance" else "Polygon"),
+                            "Market Cap Source": enriched.get("market_cap_source", "unknown"),
+                            "Quote Timestamp": enriched.get("quote_timestamp"),
+                            "Market Session": enriched.get("session", "unknown"),
+                            "Quote Delay": "unknown" if self.source == "finnhub" else "provider status unavailable",
+                            "Float Source": enriched.get("float_source"),
+                            "Shares Outstanding (M)": round(enriched["shares_outstanding"] / 1_000_000, 2) if enriched.get("shares_outstanding") else None,
                             "_raw_volume": enriched['volume'],
                             "_raw_change": enriched['change_pct'],
                             "_raw_rvol": rvol,
@@ -360,7 +467,7 @@ class MiddayScreener:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Midday Momentum Stock Screener")
     parser.add_argument("--demo", action="store_true", help="Run with mock midday market data")
-    parser.add_argument("--source", type=str, default="polygon", choices=["polygon", "yfinance"], help="Data engine source")
+    parser.add_argument("--source", type=str, default="polygon", choices=["polygon", "yfinance", "finnhub"], help="Data engine source; Finnhub uses bounded Yahoo candidate discovery")
     parser.add_argument("--min-volume", type=int, default=500000, help="Minimum active intraday volume")
     parser.add_argument("--min-rvol", type=float, default=5.0, help="Minimum Relative Volume (RVOL) multiplier (default: 5.0x)")
     parser.add_argument("--float-mode", choices=["strict", "discovery"], default="strict", help="Strictly require public float or include unknown float flagged")
@@ -369,8 +476,8 @@ if __name__ == "__main__":
         "-k",
         "--api-key",
         type=str,
-        default=os.getenv("MASSIVE_API_KEY") or os.getenv("POLYGON_API_KEY") or "",
-        help="Polygon API Key",
+        default="",
+        help="Provider API key (Finnhub source reads FINNHUB_API_KEY by default)",
     )
 
     args = parser.parse_args()
@@ -393,6 +500,9 @@ if __name__ == "__main__":
         display["Today's Change %"] = display["Today's Change %"].map(lambda v: f"{v:+.2f}%")
         display["Volume"] = display["Volume"].map(lambda v: f"{int(v):,}")
         display["RVOL"] = display["RVOL"].map(lambda v: f"{v:.1f}x")
+        for column in ("Float (M)", "Shares Outstanding (M)"):
+            if column in display.columns:
+                display[column] = display[column].map(lambda v: f"{v:.2f}" if pd.notna(v) else "N/A")
         print(display.to_string(index=False))
     else:
         print("No stocks currently match the exact midday momentum criteria.")
