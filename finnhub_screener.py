@@ -69,7 +69,7 @@ class FinnhubScreener:
         min_change_pct: float = 10.0,
         max_float: float = 10.0,  # in Millions
         max_market_cap: float = 100.0,  # in Millions
-        min_rvol: float = 1.0,
+        min_rvol: float = 0.0,
         min_volume: int = 500_000,
         max_workers: int = 5,
         float_mode: str = "strict",
@@ -86,6 +86,7 @@ class FinnhubScreener:
         self.float_mode = float_mode
         self.last_status = "ok"
         self.last_error = None
+        self.scan_errors = []
 
         if not FINNHUB_AVAILABLE:
             logger.warning("finnhub-python package not installed. Run: pip install finnhub-python")
@@ -190,33 +191,64 @@ class FinnhubScreener:
         except Exception as e:
             self.last_status = "incomplete"
             self.last_error = f"Finnhub data unavailable for {symbol} ({type(e).__name__})."
-            logger.debug(f"Error fetching Finnhub data for {symbol}: {e}")
-            return None
+            logger.warning(f"Error fetching Finnhub data for {symbol}: {e}")
+            raise
 
     def scan(self, watchlist: Optional[List[str]] = None, demo: bool = False) -> pd.DataFrame:
         """Run the Finnhub screener."""
         self.last_status = "ok"
         self.last_error = None
+        self.scan_errors = []
         if demo:
             return self._run_demo()
         if not self.client:
             self.last_status = "failed"
-            self.last_error = "Finnhub client or API key is unavailable."
-            return pd.DataFrame()
+            if not FINNHUB_AVAILABLE:
+                self.last_error = "finnhub-python package not installed. Run: pip install finnhub-python"
+            else:
+                self.last_error = "Finnhub API key missing. Set FINNHUB_API_KEY in .env or pass --api-key."
+            self.scan_errors = [self.last_error]
+            return pd.DataFrame(columns=["Ticker", "Price", "Today's Change %", "Volume", "RVOL", "Market Cap ($M)", "Float (M)"])
 
         symbols = watchlist or ACTIVE_WATCHLIST
         logger.info(f"Scanning {len(symbols)} symbols via Finnhub API...")
 
         matches = []
+        failed_requests = []
+        auth_failure_msg = None
+
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             futures = {executor.submit(self.fetch_ticker_data, sym): sym for sym in symbols}
             for future in as_completed(futures):
-                res = future.result()
-                if res:
-                    matches.append(res)
+                sym = futures[future]
+                try:
+                    res = future.result()
+                    if res:
+                        matches.append(res)
+                except Exception as e:
+                    err_msg = str(e)
+                    self.scan_errors.append(f"{sym}: {err_msg}")
+                    failed_requests.append((sym, err_msg))
+                    lower_msg = err_msg.lower()
+                    if "401" in lower_msg or "403" in lower_msg or "unauthorized" in lower_msg or "forbidden" in lower_msg:
+                        auth_failure_msg = f"Finnhub authentication or entitlement failed ({err_msg})."
+
+        if auth_failure_msg:
+            self.last_status = "failed"
+            self.last_error = auth_failure_msg
+        elif failed_requests and not matches:
+            self.last_status = "failed"
+            self.last_error = f"Finnhub requests failed for all {len(failed_requests)} candidate(s)."
+        elif failed_requests:
+            self.last_status = "incomplete"
+            self.last_error = f"Finnhub data incomplete for {len(failed_requests)} candidate(s)."
+        else:
+            self.last_status = "ok"
+            self.last_error = None
 
         if not matches:
-            logger.info("No symbols currently matched the exact momentum criteria on Finnhub.")
+            if not failed_requests and not auth_failure_msg:
+                logger.info("No symbols currently matched the exact momentum criteria on Finnhub.")
             return pd.DataFrame(columns=["Ticker", "Price", "Today's Change %", "Volume", "RVOL", "Market Cap ($M)", "Float (M)"])
 
         df = pd.DataFrame(matches)
@@ -227,8 +259,14 @@ class FinnhubScreener:
         filtered = []
         for d in DEMO_DATA:
             rvol = round(d["volume"] / d["avg_volume"], 1) if d["avg_volume"] > 0 else 1.0
-            if (self.min_price <= d["price"] <= self.max_price) and (d["change_pct"] >= self.min_change_pct) and (rvol >= self.min_rvol):
-                if d["float"] <= self.max_float and d["market_cap"] <= self.max_market_cap:
+            if (
+                (self.min_price <= d["price"] <= self.max_price)
+                and (d["change_pct"] >= self.min_change_pct)
+                and (d["volume"] >= self.min_volume)
+                and (rvol >= self.min_rvol)
+                and (d["float"] <= self.max_float)
+                and (d["market_cap"] <= self.max_market_cap)
+            ):
                     filtered.append({
                         "Ticker": d["ticker"],
                         "Price": d["price"],
@@ -259,11 +297,21 @@ class FinnhubScreener:
         return display_df
 
 
-def print_results(df: pd.DataFrame):
+def print_results(df: pd.DataFrame, screener: Optional[FinnhubScreener] = None):
     print("\n" + "=" * 85)
     print(" " * 20 + "SMALL-CAP MOMENTUM SCREENER (FINNHUB API)")
     print("=" * 85)
-    print("Rules: Price: $2-$10 | Change: >=+10% | Float: <=10M | MktCap: <=$100M | RVOL: >=1.0x")
+    if screener:
+        rules_str = (
+            f"Rules: Price: ${screener.min_price:g}-${screener.max_price:g} | "
+            f"Change: >=+{screener.min_change_pct:g}% | "
+            f"Float: <={screener.max_float:g}M | "
+            f"MktCap: <=${screener.max_market_cap:g}M | "
+            f"RVOL: >={screener.min_rvol:.1f}x"
+        )
+        print(rules_str)
+    else:
+        print("Rules: Price: $2-$10 | Change: >=+10% | Float: <=10M | MktCap: <=$100M | RVOL: >=1.0x")
     print("-" * 85)
 
     if df.empty:
@@ -289,6 +337,8 @@ def main():
     parser.add_argument("--min-change", type=float, default=10.0, help="Minimum percentage change")
     parser.add_argument("--max-float", type=float, default=10.0, help="Maximum float in Millions")
     parser.add_argument("--max-market-cap", type=float, default=100.0, help="Maximum market cap in Millions")
+    parser.add_argument("--min-rvol", type=float, default=1.0, help="Minimum Relative Volume (RVOL) multiplier (default: 1.0x)")
+    parser.add_argument("--min-volume", type=int, default=500_000, help="Minimum active intraday volume (default: 500000)")
     parser.add_argument("-k", "--api-key", default=os.getenv("FINNHUB_API_KEY"), help="Finnhub API Key")
     parser.add_argument("--float-mode", choices=["strict", "discovery"], default="strict")
     parser.add_argument("--watchlist", help="Ticker list file (one symbol per line or comma-separated)")
@@ -304,6 +354,8 @@ def main():
         min_change_pct=args.min_change,
         max_float=args.max_float,
         max_market_cap=args.max_market_cap,
+        min_rvol=args.min_rvol,
+        min_volume=args.min_volume,
         float_mode=args.float_mode,
     )
     watchlist, invalid = load_watchlist(args.watchlist) if args.watchlist else (None, [])
@@ -312,7 +364,7 @@ def main():
     if args.watchlist and not watchlist:
         parser.error("watchlist contains no valid ticker symbols")
     df = screener.scan(watchlist=watchlist, demo=args.demo)
-    print_results(df)
+    print_results(df, screener=screener)
     if screener.last_status != "ok":
         print(f"[SCAN STATUS: {screener.last_status}] {screener.last_error or ''}")
     if watchlist:

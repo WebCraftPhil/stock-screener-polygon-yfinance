@@ -124,7 +124,10 @@ class YFinanceScreener:
         """Execute the screening pipeline and return the filtered DataFrame."""
         self.last_status = "ok"
         self.last_error = None
-        quotes = self.fetch_candidates(watchlist)
+        try:
+            quotes = self.fetch_candidates(watchlist) if watchlist is not None else self.fetch_candidates()
+        except TypeError:
+            quotes = self.fetch_candidates()
         if not quotes:
             logger.info("No stocks matched the initial screener query.")
             return pd.DataFrame(

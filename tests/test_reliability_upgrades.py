@@ -1,4 +1,4 @@
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 from datetime import datetime, timezone
 
 from finnhub_screener import FinnhubScreener
@@ -54,10 +54,11 @@ def test_finnhub_never_substitutes_shares_outstanding_for_float():
 
 
 def test_midday_provider_failure_is_not_reported_as_empty_success():
-    screener = MiddayScreener(source="polygon")
+    with patch.dict("os.environ", {}, clear=True):
+        screener = MiddayScreener(source="polygon")
 
-    result = screener.run()
+        result = screener.run()
 
-    assert result.empty
-    assert screener.last_status == "failed"
-    assert screener.last_error
+        assert result.empty
+        assert screener.last_status == "failed"
+        assert screener.last_error

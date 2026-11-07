@@ -79,7 +79,22 @@ python midday_screener.py --source finnhub
 python finnhub_screener.py
 ```
 
+The standalone `finnhub_screener.py` scan is limited by default to a fixed 20-symbol `ACTIVE_WATCHLIST`, distinguishing it from `midday_screener.py --source finnhub` which uses a dynamic Yahoo-discovered candidate list.
+
 Results sort by volume by default. DataFrames retain numeric values; terminal output formats values for readability. Output labels public float as `Float`, never estimated float.
+
+## Leveraged All-Weather Strategy & Backtest
+
+- **`strategy_botspot.py`**: Clean Lumibot strategy implementing the 3x Leveraged All-Weather portfolio (`TQQQ`, `UPRO`, `UDOW`, `TMF`, `UGL`, `DIG`) with drift-based rebalancing.
+- **`backtest_leveraged_allweather.py`**: Standalone backtesting engine modeling exact drift evaluation, transaction fees, and SPY benchmark comparison.
+
+```bash
+# Run 5-year historical backtest
+python backtest_leveraged_allweather.py --years 5
+
+# Test custom drift threshold (e.g. 15% vs 26%)
+python backtest_leveraged_allweather.py --years 5 --drift 0.15
+```
 
 ## Tests
 

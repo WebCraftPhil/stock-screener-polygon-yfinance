@@ -758,10 +758,113 @@ def test_polygon_historical_avg_volume_skips_repeat_requests_on_none():
         aggs_calls = [c for c in pget.call_args_list if "aggs" in c[0][0]]
         # Exactly 1 call to aggs, no repeat request after None
         assert len(aggs_calls) == 1
-        # Proceeded to fallback baseline (100000), calculated RVOL = 10.0x, passed screener
-        assert len(df) == 1
-        assert df.iloc[0]["Ticker"] == "FAIL_AGGS"
-        assert df.iloc[0]["RVOL"] == 10.0
+        # No fallback baseline is substituted; candidate without history is excluded
+        assert df.empty
+        assert screener.last_status == "incomplete"
+        assert "excluded" in screener.last_error
+
+
+def test_finnhub_screener_print_results_reflects_configuration(capsys):
+    from finnhub_screener import FinnhubScreener, print_results
+    screener = FinnhubScreener(
+        min_price=3.0, max_price=8.0, min_change_pct=15.0,
+        max_float=5.0, max_market_cap=50.0, min_rvol=2.0
+    )
+    df = pd.DataFrame()
+    print_results(df, screener=screener)
+    captured = capsys.readouterr().out
+    assert "Price: $3-$8" in captured
+    assert "Change: >=+15%" in captured
+    assert "Float: <=5M" in captured
+    assert "MktCap: <=$50M" in captured
+    assert "RVOL: >=2.0x" in captured
+
+
+def test_finnhub_screener_scan_no_client_returns_configuration_error_without_demo():
+    from finnhub_screener import FinnhubScreener
+    screener = FinnhubScreener(api_key=None)
+    screener.client = None
+    df = screener.scan(demo=False)
+    assert df.empty
+    assert screener.last_status == "failed"
+    assert "Finnhub API key missing" in screener.last_error or "finnhub-python package not installed" in screener.last_error
+
+
+def test_finnhub_screener_demo_filter_enforces_min_volume():
+    from finnhub_screener import FinnhubScreener
+    # Default min_volume is 500,000. BLZE has volume 400,000 and should be excluded.
+    # If we set min_volume to 1,000,000, RONI (850k) and ZGNL (620k) should also be excluded.
+    s1 = FinnhubScreener(min_volume=1_000_000, min_rvol=0.0)
+    df = s1.scan(demo=True)
+    tickers = set(df["Ticker"])
+    assert "RONI" not in tickers
+    assert "ZGNL" not in tickers
+    assert "BLZE" not in tickers
+    assert "APEX" in tickers  # APEX volume is 1.42M
+    assert "VORT" in tickers  # VORT volume is 3.1M
+
+
+def test_finnhub_screener_records_failed_requests_and_retains_successful_rows():
+    from finnhub_screener import FinnhubScreener
+    screener = FinnhubScreener(api_key="TEST")
+    screener.client = Mock()
+
+    def mock_fetch(symbol):
+        if symbol == "SUCCESS":
+            return {
+                "Ticker": "SUCCESS", "Price": 5.0, "Today's Change %": 15.0,
+                "Volume": 1_000_000, "RVOL": 2.0, "Market Cap ($M)": 50.0,
+                "Float (M)": 5.0,
+            }
+        elif symbol == "FAIL_REQ":
+            raise RuntimeError("Request timeout")
+        return None
+
+    screener.fetch_ticker_data = mock_fetch
+    df = screener.scan(watchlist=["SUCCESS", "FAIL_REQ"])
+
+    assert len(df) == 1
+    assert df.iloc[0]["Ticker"] == "SUCCESS"
+    assert screener.last_status == "incomplete"
+    assert "FAIL_REQ: Request timeout" in screener.scan_errors
+    assert "1 candidate(s)" in screener.last_error
+
+
+def test_midday_provider_fallback_does_not_switch_to_finnhub_with_explicit_key():
+    from midday_screener import MiddayScreener
+    with patch.dict("os.environ", {"FINNHUB_API_KEY": "FH_KEY"}, clear=True):
+        screener = MiddayScreener(api_key="EXPLICIT_POLYGON_KEY", source="polygon")
+        assert screener.source == "polygon"
+        assert screener.api_key == "EXPLICIT_POLYGON_KEY"
+
+
+def test_midday_polygon_403_finnhub_auth_error_falls_back_to_yahoo():
+    from midday_screener import MiddayScreener
+    with patch.dict("os.environ", {"FINNHUB_API_KEY": "FH_KEY", "POLYGON_API_KEY": "POLY_KEY"}):
+        screener = MiddayScreener(api_key="POLY_KEY", source="polygon")
+
+        mock_resp_403 = Mock(status_code=403)
+        with patch.object(screener, "_get", return_value=mock_resp_403):
+            # Finnhub fetch fails with auth error
+            def mock_finnhub():
+                screener.last_status = "failed"
+                screener.last_error = "Finnhub authentication or entitlement failed (HTTP 401)."
+                return []
+
+            # Yahoo fallback succeeds
+            def mock_yahoo(limit=250, symbols=None):
+                return [{"ticker": "YF_STOCK", "price": 5.0, "change_pct": 12.0, "volume": 1_000_000, "avg_volume": 100_000, "market_cap": 25_000_000, "float": 5_000_000}]
+
+            screener.fetch_finnhub_data = mock_finnhub
+            screener.fetch_yfinance_data = mock_yahoo
+
+            rows = screener.fetch_polygon_data()
+
+            assert len(rows) == 1
+            assert rows[0]["ticker"] == "YF_STOCK"
+            assert screener.source == "yfinance"
+            assert screener.last_status == "ok"
+            assert screener.last_error is None
 
 
 

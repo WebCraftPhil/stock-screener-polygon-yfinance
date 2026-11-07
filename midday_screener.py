@@ -49,7 +49,7 @@ class MiddayScreener:
         if isinstance(source, (int, float)) and min_rvol == 5.0:
             min_rvol = source
             source = "polygon"
-        if source == "polygon" and os.getenv("FINNHUB_API_KEY") and not (os.getenv("MASSIVE_API_KEY") or os.getenv("POLYGON_API_KEY")):
+        if not api_key and source == "polygon" and os.getenv("FINNHUB_API_KEY") and not (os.getenv("MASSIVE_API_KEY") or os.getenv("POLYGON_API_KEY")):
             source = "finnhub"
         self.source = source
         self.float_mode = float_mode
@@ -106,7 +106,23 @@ class MiddayScreener:
                 print("[*] Automatically falling back to Finnhub live engine (--source finnhub)...")
                 self.api_key = os.getenv("FINNHUB_API_KEY")
                 self.source = "finnhub"
-                return self.fetch_finnhub_data()
+                rows = self.fetch_finnhub_data()
+                is_auth_error = (
+                    self.last_status == "failed"
+                    and self.last_error
+                    and ("authentication" in self.last_error.lower() or "entitlement" in self.last_error.lower())
+                )
+                if is_auth_error and YFINANCE_AVAILABLE:
+                    print("[*] Finnhub authentication/entitlement failed. Automatically falling back to Yahoo Finance (--source yfinance)...")
+                    self.source = "yfinance"
+                    self.last_status = "ok"
+                    self.last_error = None
+                    yf_rows = self.fetch_yfinance_data()
+                    if self.last_status != "failed":
+                        self.last_status = "ok"
+                        self.last_error = None
+                    return yf_rows
+                return rows
             elif YFINANCE_AVAILABLE:
                 print("[*] Automatically falling back to Yahoo Finance live engine (--source yfinance)...")
                 return self.fetch_yfinance_data()
